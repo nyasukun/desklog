@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>ja</string>
+    <key>CFBundleDisplayName</key>
+    <string>Desklog</string>
+    <key>CFBundleExecutable</key>
+    <string>Desklog</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.desklog.app</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Desklog</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.3.0</string>
+    <key>CFBundleVersion</key>
+    <string>3</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>周囲の会話をこのMac内で文字起こしし、ワークログに記録するためにマイクを使います。</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>選択したウィンドウやディスプレイをこのMac内でOCRし、ローカルのワークログに記録します。</string>
+</dict>
+</plist>
