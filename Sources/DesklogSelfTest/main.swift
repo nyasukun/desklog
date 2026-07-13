@@ -195,12 +195,14 @@ enum DesklogSelfTest {
         )
         try require(defaults.whisperExecutablePath.hasSuffix("whisper-cli"), "default Whisper executable is incorrect")
         try require(defaults.whisperModelPath.hasSuffix("ggml-large-v3-turbo-q5_0.bin"), "default Whisper model is incorrect")
+        try require(!defaults.externalControlEnabled, "external control must be opt-in")
 
         let oldJSON = """
         {"captureIntervalSeconds":60,"saveScreenshots":true,"ocrLanguages":["ja-JP"],"speechLocale":"ja-JP","ollamaBaseURL":"http://127.0.0.1:11434","ollamaModel":"custom:latest","summaryHours":8}
         """
         let migrated = try JSONDecoder().decode(DesklogConfiguration.self, from: Data(oldJSON.utf8))
         try require(!migrated.summaryScheduleEnabled, "old configuration unexpectedly enabled scheduling")
+        try require(!migrated.externalControlEnabled, "old configuration unexpectedly enabled external control")
         try require(migrated.summaryScheduleHour == 18, "old configuration schedule was not defaulted")
         try require(migrated.ollamaModel == "custom:latest", "existing model setting was not preserved")
         try require(

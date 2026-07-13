@@ -184,6 +184,7 @@ public struct WorklogEvent: Codable, Identifiable, Sendable, Equatable {
 public struct DesklogConfiguration: Codable, Sendable, Equatable {
     public var screenCaptureEnabled: Bool
     public var microphoneCaptureEnabled: Bool
+    public var externalControlEnabled: Bool
     public var excludedCaptureWindows: [ExcludedCaptureWindow] {
         didSet {
             excludedCaptureWindows = CaptureExclusionPolicy(
@@ -250,6 +251,7 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
     public init(
         screenCaptureEnabled: Bool = true,
         microphoneCaptureEnabled: Bool = true,
+        externalControlEnabled: Bool = false,
         excludedCaptureWindows: [ExcludedCaptureWindow] = [],
         captureIntervalSeconds: TimeInterval = 60,
         saveScreenshots: Bool = true,
@@ -267,6 +269,7 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
     ) {
         self.screenCaptureEnabled = screenCaptureEnabled
         self.microphoneCaptureEnabled = microphoneCaptureEnabled
+        self.externalControlEnabled = externalControlEnabled
         self.excludedCaptureWindows = CaptureExclusionPolicy(
             windows: excludedCaptureWindows
         ).windows
@@ -291,6 +294,7 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case screenCaptureEnabled
         case microphoneCaptureEnabled
+        case externalControlEnabled
         case excludedCaptureWindows
         case captureIntervalSeconds
         case saveScreenshots
@@ -312,6 +316,7 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
         self.init(
             screenCaptureEnabled: try values.decodeIfPresent(Bool.self, forKey: .screenCaptureEnabled) ?? true,
             microphoneCaptureEnabled: try values.decodeIfPresent(Bool.self, forKey: .microphoneCaptureEnabled) ?? true,
+            externalControlEnabled: try values.decodeIfPresent(Bool.self, forKey: .externalControlEnabled) ?? false,
             excludedCaptureWindows: try values.decodeIfPresent(
                 [ExcludedCaptureWindow].self,
                 forKey: .excludedCaptureWindows

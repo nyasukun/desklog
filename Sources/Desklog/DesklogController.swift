@@ -4,11 +4,12 @@ import Foundation
 
 @MainActor
 final class DesklogController: ObservableObject {
-    @Published private(set) var isRunning = false
+    @Published private(set) var recordingMode: RecordingMode = .stopped
     @Published private(set) var isStarting = false
     @Published private(set) var isTerminating = false
     @Published private(set) var isCapturing = false
     @Published private(set) var isSummarizing = false
+    @Published private(set) var audioAlertKind: AudioAlertKind?
     @Published private(set) var summaryCompletedSteps = 0
     @Published private(set) var summaryTotalSteps = 0
     @Published private(set) var isTestingOllama = false
@@ -65,6 +66,24 @@ final class DesklogController: ObservableObject {
     private var ollamaTestTask: Task<Void, Never>?
     private var processActivity: NSObjectProtocol?
     private var applicationActiveObserver: NSObjectProtocol?
+    private var audioAlertSnoozeState = AudioAlertSnoozeState()
+    private var audioAlertRestoreTasks: [AudioAlertKind: Task<Void, Never>] = [:]
+
+    var isRunning: Bool {
+        recordingMode != .stopped
+    }
+
+    var isAudioRecording: Bool {
+        recordingMode == .screenAndAudio
+    }
+
+    var menuBarDisplayText: String? {
+        MenuBarPresentation.statusText(
+            recordingMode: recordingMode,
+            isSummarizing: isSummarizing,
+            audioAlert: audioAlertKind
+        )
+    }
 
     init() {
         configuration = configurationStore.load()
@@ -108,90 +127,180 @@ final class DesklogController: ObservableObject {
     func start() {
         guard !isRunning, !isStarting, !isTerminating else { return }
         errorMessage = nil
-        refreshPermissions()
-        let gate = captureReadiness
-        guard gate.hasEnabledCaptureSource else {
+        permissions.refresh()
+        guard configuration.screenCaptureEnabled else {
             permissionSetupRequested = true
-            statusMessage = "記録する項目を選んでください"
+            statusMessage = "画面OCRを設定でオンにしてください"
             return
         }
-        guard gate.canStart else {
+        guard permissions.screenCaptureStatus == .authorized else {
             permissionSetupRequested = true
-            statusMessage = "記録を始める準備が必要です"
+            statusMessage = "画面記録を始める準備が必要です"
+            return
+        }
+
+        recordingMode = recordingMode.applying(.startRecording)
+        permissionSetupRequested = false
+        statusMessage = recordingMode.menuBarStatusText ?? "停止中"
+        processActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled],
+            reason: "Desklog is collecting the local worklog"
+        )
+        beginCaptureLoop()
+        queueSystemEvent("記録を開始しました（画面OCR）。")
+    }
+
+    func startAudioRecording() {
+        guard recordingMode == .screenOnly, !isStarting, !isTerminating else { return }
+        errorMessage = nil
+        permissions.refresh()
+        guard configuration.microphoneCaptureEnabled else {
+            statusMessage = "マイク文字起こしを設定でオンにしてください"
+            return
+        }
+        guard permissions.microphoneStatus == .authorized else {
+            permissionSetupRequested = true
+            statusMessage = "録音を始めるにはマイクの許可が必要です"
             return
         }
 
         isStarting = true
-        statusMessage = "ローカルモデルを確認中…"
+        statusMessage = "録音用のローカルモデルを確認中…"
         let attemptID = UUID()
         let startConfiguration = configuration
         startAttemptID = attemptID
 
         Task {
             do {
-                if startConfiguration.microphoneCaptureEnabled {
-                    try speechTranscriber.validateLocalResources(configuration: startConfiguration)
-                    try await speechTranscriber.prepareLocalModels()
-                    refreshPermissions()
-                    guard startAttemptID == attemptID else { return }
-                    try speechTranscriber.start(configuration: startConfiguration) { [weak self] update in
-                        self?.recordTranscript(update, configuration: startConfiguration)
-                    }
+                try speechTranscriber.validateLocalResources(configuration: startConfiguration)
+                try await speechTranscriber.prepareLocalModels()
+                permissions.refresh()
+                guard startAttemptID == attemptID, recordingMode == .screenOnly else { return }
+                guard configuration.screenCaptureEnabled,
+                      permissions.screenCaptureStatus == .authorized else {
+                    stop()
+                    errorMessage = "画面収録の権限が利用できなくなったため、記録を停止しました。確認してから再開してください。"
+                    permissionSetupRequested = true
+                    return
                 }
-                guard startAttemptID == attemptID else {
+                guard permissions.microphoneStatus == .authorized else {
+                    startAttemptID = nil
+                    isStarting = false
+                    permissionSetupRequested = true
+                    statusMessage = "録音を始めるにはマイクの許可が必要です"
+                    return
+                }
+                try speechTranscriber.start(
+                    configuration: startConfiguration,
+                    onUpdate: { [weak self] update in
+                        self?.recordTranscript(update, configuration: startConfiguration)
+                    },
+                    onAudioAlert: { [weak self] alert in
+                        self?.presentAudioAlert(alert)
+                    }
+                )
+                guard startAttemptID == attemptID, recordingMode == .screenOnly else {
                     speechTranscriber.stop()
                     return
                 }
                 startAttemptID = nil
-                isRunning = true
                 isStarting = false
                 permissionSetupRequested = false
-                statusMessage = "記録中"
-                processActivity = ProcessInfo.processInfo.beginActivity(
-                    options: [.userInitiated, .idleSystemSleepDisabled],
-                    reason: "Desklog is collecting the local worklog"
-                )
-                if startConfiguration.screenCaptureEnabled {
-                    beginCaptureLoop()
-                }
-                let sources = [
-                    startConfiguration.screenCaptureEnabled ? "画面OCR" : nil,
-                    startConfiguration.microphoneCaptureEnabled ? "マイク音声" : nil
-                ].compactMap { $0 }.joined(separator: "・")
-                await appendSystemEvent("記録を開始しました（\(sources)）。")
+                resetAudioAlerts()
+                recordingMode = recordingMode.applying(.startAudio)
+                statusMessage = recordingMode.menuBarStatusText ?? "停止中"
+                await appendSystemEvent("録音を開始しました。")
             } catch {
                 guard startAttemptID == attemptID else { return }
                 startAttemptID = nil
                 isStarting = false
-                fail(error)
+                fail(error, keepRunning: true)
             }
         }
+    }
+
+    func stopAudioRecording() {
+        stopAudioRecording(appendEvent: true)
     }
 
     func stop() {
         guard isRunning || isStarting || isCapturing else { return }
         let wasRunning = isRunning
         let wasStarting = isStarting
+        stopAudioRecording(appendEvent: false)
         startAttemptID = nil
         captureAttemptID = nil
         captureLoop?.cancel()
         captureLoop = nil
         screenOCR.cancelPendingCaptures()
-        speechTranscriber.stop()
         if let processActivity {
             ProcessInfo.processInfo.endActivity(processActivity)
             self.processActivity = nil
         }
         isStarting = false
-        isRunning = false
+        recordingMode = recordingMode.applying(.stopRecording)
+        resetAudioAlerts()
         statusMessage = wasStarting && !wasRunning ? "準備を中止しました" : "停止中"
         if wasRunning {
             queueSystemEvent("記録を停止しました。")
         }
     }
 
+    private func stopAudioRecording(appendEvent: Bool) {
+        let wasPreparing = isStarting && recordingMode == .screenOnly
+        let wasRecording = recordingMode == .screenAndAudio
+        guard wasPreparing || wasRecording || speechTranscriber.isRunning else { return }
+        startAttemptID = nil
+        isStarting = false
+        speechTranscriber.stop()
+        if recordingMode != .stopped {
+            recordingMode = recordingMode.applying(.stopAudio)
+            statusMessage = recordingMode.menuBarStatusText ?? "停止中"
+        }
+        resetAudioAlerts()
+        if appendEvent, wasRecording {
+            queueSystemEvent("録音を停止しました。画面記録は継続しています。")
+        }
+    }
+
     func requestTermination() {
         NSApplication.shared.terminate(nil)
+    }
+
+    func handleExternalURL(_ url: URL) {
+        guard let action = DesklogExternalAction(url: url) else { return }
+        guard configuration.externalControlEnabled else { return }
+        switch action {
+        case .startRecording:
+            start()
+        case .stopRecording:
+            stop()
+        case .startAudio:
+            startAudioRecording()
+        case .stopAudio:
+            stopAudioRecording()
+        case .startSummary:
+            summarize()
+        }
+    }
+
+    func dismissAudioAlertForTenMinutes() {
+        guard let audioAlertKind else { return }
+        audioAlertSnoozeState.snooze(audioAlertKind, at: Date())
+        self.audioAlertKind = nil
+        audioAlertRestoreTasks[audioAlertKind]?.cancel()
+        audioAlertRestoreTasks[audioAlertKind] = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 600_000_000_000)
+            } catch {
+                return
+            }
+            guard let self, self.isAudioRecording else { return }
+            self.audioAlertSnoozeState.clear(audioAlertKind)
+            self.audioAlertRestoreTasks[audioAlertKind] = nil
+            guard self.audioAlertKind == nil else { return }
+            self.presentAudioAlert(audioAlertKind)
+        }
     }
 
     /// Called by the application delegate for menu, Dock, keyboard, logout,
@@ -283,7 +392,7 @@ final class DesklogController: ObservableObject {
             guard captureAttemptID == attemptID else { return }
             latestOCR = results.map(\.text).joined(separator: "\n\n")
             lastCaptureAt = timestamp
-            statusMessage = isRunning ? "記録中" : "キャプチャ完了"
+            statusMessage = isRunning ? currentRecordingStatus : "キャプチャ完了"
         } catch is CancellationError {
             artifactTracker.discardUnpersisted()
             // Stopping a recording intentionally cancels in-flight OCR without
@@ -326,7 +435,7 @@ final class DesklogController: ObservableObject {
                     baseURL: summaryConfiguration.ollamaBaseURL,
                     model: summaryConfiguration.ollamaModel
                 )
-                let summary = try await client.summarize(
+                let generatedSummary = try await client.summarize(
                     inputs,
                     summaryPrompt: summaryConfiguration.summaryPrompt,
                     progress: { [weak self] completed, total in
@@ -334,6 +443,12 @@ final class DesklogController: ObservableObject {
                         self?.summaryTotalSteps = total
                     }
                 )
+                let summary = await Task.detached(priority: .utility) {
+                    SummaryImageEmbedder.embedRelevantCaptures(
+                        in: generatedSummary,
+                        events: events
+                    )
+                }.value
                 let url = try await store.saveSummary(summary, at: end)
                 try await store.append(.init(
                     timestamp: end,
@@ -342,7 +457,7 @@ final class DesklogController: ObservableObject {
                     metadata: ["file_path": url.path, "model": summaryConfiguration.ollamaModel]
                 ))
                 lastSummary = summary
-                statusMessage = isRunning ? "記録中" : "要約完了"
+                statusMessage = isRunning ? currentRecordingStatus : "要約完了"
             } catch {
                 if !Task.isCancelled { fail(error, keepRunning: true) }
             }
@@ -412,7 +527,7 @@ final class DesklogController: ObservableObject {
             )
             let gate = captureReadiness
             if gate.canStart {
-                statusMessage = isRunning ? "記録中" : "必要な権限を許可済み"
+                statusMessage = isRunning ? currentRecordingStatus : "必要な権限を許可済み"
             } else if screenCaptureEnabled,
                       permissions.screenCaptureStatus == .denied,
                       !microphoneEnabled || permissions.microphoneStatus != .notDetermined {
@@ -432,12 +547,25 @@ final class DesklogController: ObservableObject {
         )
     }
 
+    var canStartScreenRecording: Bool {
+        configuration.screenCaptureEnabled && permissions.screenCaptureStatus == .authorized
+    }
+
     func refreshPermissions() {
         permissions.refresh()
-        guard (isRunning || isStarting), !captureReadiness.canStart else { return }
-        stop()
-        errorMessage = "画面収録またはマイクの権限が利用できなくなったため、準備・記録を停止しました。確認してから再開してください。"
-        permissionSetupRequested = true
+        if isRunning,
+           (!configuration.screenCaptureEnabled || permissions.screenCaptureStatus != .authorized) {
+            stop()
+            errorMessage = "画面収録の権限が利用できなくなったため、記録を停止しました。確認してから再開してください。"
+            permissionSetupRequested = true
+            return
+        }
+        if (isAudioRecording || isStarting),
+           (!configuration.microphoneCaptureEnabled || permissions.microphoneStatus != .authorized) {
+            stopAudioRecording()
+            errorMessage = "マイクの権限が利用できなくなったため、録音を停止しました。画面記録は継続しています。"
+            permissionSetupRequested = true
+        }
     }
 
     func testOllamaConnection() {
@@ -505,7 +633,7 @@ final class DesklogController: ObservableObject {
                         "is_self": String(result.profile.isSelf)
                     ]
                 ))
-                statusMessage = isRunning ? "記録中" : "話者を登録しました"
+                statusMessage = isRunning ? currentRecordingStatus : "話者を登録しました"
             } catch {
                 fail(error, keepRunning: true)
             }
@@ -540,7 +668,7 @@ final class DesklogController: ObservableObject {
                         "is_self": String(profile.isSelf)
                     ]
                 ))
-                statusMessage = isRunning ? "記録中" : "話者情報を更新しました"
+                statusMessage = isRunning ? currentRecordingStatus : "話者情報を更新しました"
             } catch {
                 fail(error, keepRunning: true)
             }
@@ -710,9 +838,26 @@ final class DesklogController: ObservableObject {
         }
     }
 
+    private var currentRecordingStatus: String {
+        recordingMode.menuBarStatusText ?? "停止中"
+    }
+
+    private func presentAudioAlert(_ alert: AudioAlertKind) {
+        guard isAudioRecording else { return }
+        guard audioAlertSnoozeState.shouldPresent(alert, at: Date()) else { return }
+        audioAlertKind = alert
+    }
+
+    private func resetAudioAlerts() {
+        audioAlertKind = nil
+        audioAlertSnoozeState.reset()
+        audioAlertRestoreTasks.values.forEach { $0.cancel() }
+        audioAlertRestoreTasks.removeAll()
+    }
+
     private func fail(_ error: Error, keepRunning: Bool = false) {
         errorMessage = error.localizedDescription
-        statusMessage = keepRunning && isRunning ? "記録中（一部エラー）" : "エラー"
-        if !keepRunning { isRunning = false }
+        statusMessage = keepRunning && isRunning ? "\(currentRecordingStatus)（一部エラー）" : "エラー"
+        if !keepRunning { stop() }
     }
 }

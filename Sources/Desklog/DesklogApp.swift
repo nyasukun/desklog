@@ -4,10 +4,25 @@ import SwiftUI
 @MainActor
 final class DesklogApplicationDelegate: NSObject, NSApplicationDelegate {
     private static let hardTerminationTimeoutNanoseconds: UInt64 = 25_000_000_000
-    weak var controller: DesklogController?
+    weak var controller: DesklogController? {
+        didSet {
+            deliverPendingExternalURLs()
+        }
+    }
+    private var pendingExternalURLs: [URL] = []
     private var isDeferringTermination = false
     private var didReplyToTermination = false
     private var terminationTimeoutTask: Task<Void, Never>?
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let controller else {
+            pendingExternalURLs.append(contentsOf: urls)
+            return
+        }
+        for url in urls {
+            controller.handleExternalURL(url)
+        }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let controller else { return .terminateNow }
@@ -28,6 +43,15 @@ final class DesklogApplicationDelegate: NSObject, NSApplicationDelegate {
             finishDeferredTermination(sender)
         }
         return .terminateLater
+    }
+
+    private func deliverPendingExternalURLs() {
+        guard let controller, !pendingExternalURLs.isEmpty else { return }
+        let urls = pendingExternalURLs
+        pendingExternalURLs.removeAll()
+        for url in urls {
+            controller.handleExternalURL(url)
+        }
     }
 
     /// A final safety net for OS APIs that can remain blocked despite task
@@ -64,12 +88,20 @@ struct DesklogApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra(
-            "Desklog",
-            systemImage: controller.isRunning ? "record.circle.fill" : "record.circle"
-        ) {
+        MenuBarExtra {
             MenuBarView(controller: controller) {
                 windowManager.show()
+            }
+        } label: {
+            if let displayText = controller.menuBarDisplayText {
+                Label(
+                    displayText,
+                    systemImage: controller.isRunning ? "record.circle.fill" : "record.circle"
+                )
+                .labelStyle(.titleAndIcon)
+            } else {
+                Image(systemName: controller.isRunning ? "record.circle.fill" : "record.circle")
+                    .accessibilityLabel("Desklog")
             }
         }
         .menuBarExtraStyle(.menu)

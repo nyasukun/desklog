@@ -15,6 +15,7 @@ import Testing
         let configuration = try JSONDecoder().decode(DesklogConfiguration.self, from: data)
         #expect(configuration.screenCaptureEnabled)
         #expect(configuration.microphoneCaptureEnabled)
+        #expect(!configuration.externalControlEnabled)
         #expect(configuration.excludedCaptureWindows.isEmpty)
 
         let encoded = try #require(JSONSerialization.jsonObject(
@@ -27,6 +28,7 @@ import Testing
     @Test func captureSourceSelectionsAndExcludedWindowsRoundTrip() throws {
         var configuration = DesklogConfiguration()
         configuration.screenCaptureEnabled = false
+        configuration.externalControlEnabled = true
         configuration.excludedCaptureWindows = [
             .init(windowID: 123, bundleIdentifier: "com.apple.Safari", applicationName: "Safari", windowTitle: "Private"),
             .init(windowID: 456, bundleIdentifier: "com.apple.Notes", applicationName: "Notes", windowTitle: "Passwords"),
@@ -37,6 +39,7 @@ import Testing
             from: JSONEncoder().encode(configuration)
         )
         #expect(decoded == configuration)
+        #expect(decoded.externalControlEnabled)
         #expect(decoded.excludesCaptureWindow(windowID: 123, bundleIdentifier: "COM.APPLE.SAFARI"))
         #expect(!decoded.excludesCaptureWindow(windowID: 124, bundleIdentifier: "com.apple.Safari"))
     }

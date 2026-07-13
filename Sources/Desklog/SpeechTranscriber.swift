@@ -1,6 +1,7 @@
 import AVFoundation
 import DesklogCore
 import Foundation
+import SoundAnalysis
 
 struct TranscriptUpdate: Sendable {
     let segmentID: String
@@ -8,6 +9,76 @@ struct TranscriptUpdate: Sendable {
     let isFinal: Bool
     let localSpeakerID: Int
     let speakerEmbedding: [Float]
+}
+
+private final class MusicClassificationObserver: NSObject, SNResultsObserving {
+    private let onConfidence: (Double) -> Void
+    private let onError: (Error) -> Void
+
+    init(
+        onConfidence: @escaping (Double) -> Void,
+        onError: @escaping (Error) -> Void
+    ) {
+        self.onConfidence = onConfidence
+        self.onError = onError
+    }
+
+    func request(_ request: any SNRequest, didProduce result: any SNResult) {
+        guard let classification = result as? SNClassificationResult else { return }
+        onConfidence(classification.classification(forIdentifier: "music")?.confidence ?? 0)
+    }
+
+    func request(_ request: any SNRequest, didFailWithError error: any Error) {
+        onError(error)
+    }
+}
+
+/// Owns one SoundAnalysis stream and serializes tap delivery against teardown.
+/// AVAudioEngine invokes its tap off the main actor, so the analyzer and frame
+/// position must not be stored directly on `SpeechTranscriber`.
+private final class SoundAnalysisSession: @unchecked Sendable {
+    private let lock = NSLock()
+    private var analyzer: SNAudioStreamAnalyzer?
+    private let request: SNClassifySoundRequest
+    private let observer: MusicClassificationObserver
+    private var nextFramePosition: AVAudioFramePosition = 0
+
+    init(
+        format: AVAudioFormat,
+        onConfidence: @escaping (Double) -> Void,
+        onError: @escaping (Error) -> Void
+    ) throws {
+        let analyzer = SNAudioStreamAnalyzer(format: format)
+        let observer = MusicClassificationObserver(
+            onConfidence: onConfidence,
+            onError: onError
+        )
+        let request = try SNClassifySoundRequest(classifierIdentifier: .version1)
+        request.overlapFactor = 0.5
+        try analyzer.add(request, withObserver: observer)
+        self.analyzer = analyzer
+        self.request = request
+        self.observer = observer
+    }
+
+    func analyze(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let analyzer else { return }
+        let framePosition = nextFramePosition
+        nextFramePosition += AVAudioFramePosition(buffer.frameLength)
+        analyzer.analyze(buffer, atAudioFramePosition: framePosition)
+    }
+
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let analyzer else { return }
+        self.analyzer = nil
+        analyzer.completeAnalysis()
+        analyzer.removeAllRequests()
+        nextFramePosition = 0
+    }
 }
 
 @MainActor
@@ -33,6 +104,7 @@ final class SpeechTranscriber: ObservableObject {
     private var lastAudioBufferAt: Date?
     private var recordingStartedAt = Date.distantPast
     private var onUpdate: ((TranscriptUpdate) -> Void)?
+    private var onAudioAlert: ((AudioAlertKind) -> Void)?
     private var configuration: DesklogConfiguration?
     private var activeTranscriptions = 0
     private var liveTranscriptBuffer = LiveTranscriptBuffer()
@@ -42,6 +114,8 @@ final class SpeechTranscriber: ObservableObject {
     private var activeTranscriptionsBySession: [UUID: Int] = [:]
     private var transcriptionTasks: [UUID: Task<Void, Never>] = [:]
     private var transcriptionWaiters: [CheckedContinuation<Void, Never>] = []
+    private var audioActivityMonitor = AudioActivityMonitor()
+    private var soundAnalysisSession: SoundAnalysisSession?
 
     init() {
         inputDeviceName = AVCaptureDevice.default(for: .audio)?.localizedName ?? "デフォルトマイク"
@@ -98,12 +172,17 @@ final class SpeechTranscriber: ObservableObject {
         liveText = liveTranscriptBuffer.renderedText
     }
 
-    func start(configuration: DesklogConfiguration, onUpdate: @escaping (TranscriptUpdate) -> Void) throws {
+    func start(
+        configuration: DesklogConfiguration,
+        onUpdate: @escaping (TranscriptUpdate) -> Void,
+        onAudioAlert: @escaping (AudioAlertKind) -> Void
+    ) throws {
         guard !isRunning else { return }
         try validateLocalResources(configuration: configuration)
 
         self.configuration = configuration
         self.onUpdate = onUpdate
+        self.onAudioAlert = onAudioAlert
         inputDeviceName = AVCaptureDevice.default(for: .audio)?.localizedName ?? "デフォルトマイク"
         lastError = nil
         liveTranscriptBuffer.removeAllLines()
@@ -117,6 +196,8 @@ final class SpeechTranscriber: ObservableObject {
             activeTranscriptionsBySession.removeValue(forKey: previousSessionID)
         }
         recordingStartedAt = Date()
+        audioActivityMonitor.reset()
+        _ = audioActivityMonitor.observeInputLevel(0, at: recordingStartedAt)
         isRunning = true
 
         do {
@@ -126,6 +207,8 @@ final class SpeechTranscriber: ObservableObject {
         } catch {
             isRunning = false
             stopAudioEngine()
+            self.onAudioAlert = nil
+            audioActivityMonitor.reset()
             audioStatus = "開始失敗"
             lastError = error.localizedDescription
             throw error
@@ -141,6 +224,8 @@ final class SpeechTranscriber: ObservableObject {
         diagnosticTask = nil
         stopAudioEngine()
         flushAudioSegment(includeOverlap: false)
+        onAudioAlert = nil
+        audioActivityMonitor.reset()
         inputLevel = 0
         hasReceivedAudioBuffers = false
         audioStatus = activeTranscriptions > 0 ? "最後の音声を文字起こし中…" : "停止中"
@@ -178,20 +263,29 @@ final class SpeechTranscriber: ObservableObject {
         lastAudioBufferAt = nil
         hasReceivedAudioBuffers = false
         audioStatus = "Whisper用の音声を収集中…"
+        let analysisSession = try makeSoundAnalysisSession(format: format)
+        soundAnalysisSession = analysisSession
+        let sampleAccumulator = accumulator
+        let meteringSessionID = sessionID
 
         var lastMeterUpdate = 0.0
         inputNode.installTap(onBus: 0, bufferSize: 1_024, format: format) { [weak self] buffer, _ in
-            guard let self else { return }
-            self.accumulator.append(buffer)
+            sampleAccumulator.append(buffer)
+            analysisSession.analyze(buffer)
             let now = CFAbsoluteTimeGetCurrent()
             guard now - lastMeterUpdate >= 0.1 else { return }
             lastMeterUpdate = now
             let level = AudioSampleAccumulator.normalizedLevel(for: buffer)
-            Task { @MainActor in
-                guard self.isRunning else { return }
-                self.lastAudioBufferAt = Date()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.isRunning, self.sessionID == meteringSessionID else { return }
+                let observedAt = Date()
+                self.lastAudioBufferAt = observedAt
                 self.hasReceivedAudioBuffers = true
                 self.inputLevel = max(level, self.inputLevel * 0.65)
+                if let alert = self.audioActivityMonitor.observeInputLevel(level, at: observedAt) {
+                    self.onAudioAlert?(alert)
+                }
                 if !self.isTranscribing {
                     self.audioStatus = level >= 0.04 ? "音声を収集中" : "マイク接続済み（音声待ち）"
                 }
@@ -200,6 +294,29 @@ final class SpeechTranscriber: ObservableObject {
         isInputTapInstalled = true
         audioEngine.prepare()
         try audioEngine.start()
+    }
+
+    private func makeSoundAnalysisSession(format: AVAudioFormat) throws -> SoundAnalysisSession {
+        let analysisSessionID = sessionID
+        return try SoundAnalysisSession(
+            format: format,
+            onConfidence: { [weak self] confidence in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isRunning,
+                          self.sessionID == analysisSessionID else { return }
+                    if let alert = self.audioActivityMonitor.observeMusicConfidence(confidence) {
+                        self.onAudioAlert?(alert)
+                    }
+                }
+            },
+            onError: { [weak self] error in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isRunning,
+                          self.sessionID == analysisSessionID else { return }
+                    self.lastError = "音楽の検出を継続できません: \(error.localizedDescription)"
+                }
+            }
+        )
     }
 
     private func startSegmentTimer() {
@@ -309,14 +426,21 @@ final class SpeechTranscriber: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self, self.isRunning, !Task.isCancelled else { return }
+                let now = Date()
                 if let lastAudioBufferAt = self.lastAudioBufferAt,
-                   Date().timeIntervalSince(lastAudioBufferAt) > 3 {
+                   now.timeIntervalSince(lastAudioBufferAt) > 3 {
                     self.audioStatus = "マイク入力が停止しています"
                     self.inputLevel = 0
                 } else if self.lastAudioBufferAt == nil,
-                          Date().timeIntervalSince(self.recordingStartedAt) > 3 {
+                          now.timeIntervalSince(self.recordingStartedAt) > 3 {
                     self.audioStatus = "マイクから音声バッファを受信できません"
                     self.lastError = "入力デバイスとマイク権限を確認してください。"
+                }
+                if let alert = self.audioActivityMonitor.observeInputLevel(
+                    self.inputLevel,
+                    at: now
+                ) {
+                    self.onAudioAlert?(alert)
                 }
             }
         }
@@ -328,6 +452,8 @@ final class SpeechTranscriber: ObservableObject {
             audioEngine.inputNode.removeTap(onBus: 0)
             isInputTapInstalled = false
         }
+        soundAnalysisSession?.finish()
+        soundAnalysisSession = nil
         inputLevel = 0
     }
 

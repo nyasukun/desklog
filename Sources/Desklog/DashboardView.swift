@@ -7,12 +7,36 @@ struct MenuBarView: View {
     let openMainWindow: () -> Void
 
     var body: some View {
-        Text("状態: \(controller.statusMessage)")
+        if let alert = controller.audioAlertKind {
+            Button {
+                controller.dismissAudioAlertForTenMinutes()
+            } label: {
+                Label(alert.message, systemImage: "exclamationmark.triangle.fill")
+            }
+            .help("クリックすると、この表示を10分間隠します")
+        } else if let state = controller.menuBarDisplayText {
+            Text("状態: \(state)")
+        }
 
-        Button(controller.isRunning || controller.isStarting ? "準備・記録を停止" : "記録を開始") {
-            controller.isRunning || controller.isStarting ? controller.stop() : controller.start()
+        Button(controller.isRunning ? "記録を停止" : "記録を開始（画面のみ）") {
+            controller.isRunning ? controller.stop() : controller.start()
         }
         .disabled(controller.isTerminating)
+
+        if controller.isRunning {
+            Button(controller.isAudioRecording || controller.isStarting ? "録音を停止" : "録音を開始") {
+                controller.isAudioRecording || controller.isStarting
+                    ? controller.stopAudioRecording()
+                    : controller.startAudioRecording()
+            }
+            .disabled(
+                controller.isTerminating ||
+                    (!controller.configuration.microphoneCaptureEnabled && !controller.isAudioRecording)
+            )
+        }
+
+        Button("要約を開始") { controller.summarize() }
+            .disabled(controller.isSummarizing || controller.isTerminating)
 
         Divider()
 
@@ -148,29 +172,38 @@ private struct DashboardView: View {
                     .accessibilityValue(summaryProgressLabel)
                 }
 
-                if controller.permissionSetupRequested || !controller.captureReadiness.canStart {
+                if controller.permissionSetupRequested || !controller.canStartScreenRecording {
                     PermissionSetupView(controller: controller)
                 }
 
                 HStack {
                     Button(primaryActionTitle) {
-                        controller.isRunning || controller.isStarting
+                        controller.isRunning
                             ? controller.stop()
                             : controller.start()
                     }
                     .buttonStyle(.borderedProminent)
+
+                    Button(audioActionTitle) {
+                        controller.isAudioRecording || controller.isStarting
+                            ? controller.stopAudioRecording()
+                            : controller.startAudioRecording()
+                    }
+                    .disabled(
+                        !controller.isRunning ||
+                            (!controller.configuration.microphoneCaptureEnabled && !controller.isAudioRecording)
+                    )
 
                     Button("今すぐキャプチャ") {
                         Task { await controller.captureNow() }
                     }
                     .disabled(
                         controller.isCapturing ||
-                            !controller.configuration.screenCaptureEnabled ||
-                            controller.isStarting
+                            !controller.configuration.screenCaptureEnabled
                     )
 
                     Button("ワークログを要約") { controller.summarize() }
-                        .disabled(controller.isSummarizing || controller.isStarting)
+                        .disabled(controller.isSummarizing)
 
                     Spacer()
                     Button("ログを開く") { controller.openLogDirectory() }
@@ -235,8 +268,12 @@ private struct DashboardView: View {
 
     private var primaryActionTitle: String {
         if controller.isRunning { return "記録を停止" }
-        if controller.isStarting { return "準備を中止" }
-        return controller.captureReadiness.canStart ? "記録を開始" : "記録の準備"
+        return controller.canStartScreenRecording ? "記録を開始（画面のみ）" : "記録の準備"
+    }
+
+    private var audioActionTitle: String {
+        if controller.isStarting { return "録音の準備を中止" }
+        return controller.isAudioRecording ? "録音を停止" : "録音を開始"
     }
 
     private var summaryProgressLabel: String {
@@ -266,7 +303,7 @@ private struct SettingsView: View {
                     .disabled(controller.isRunning || controller.isStarting)
                 Toggle("マイク音声を文字起こし", isOn: $controller.configuration.microphoneCaptureEnabled)
                     .disabled(controller.isRunning || controller.isStarting)
-                Text("必要な収集元だけをオンにできます。オフにした収集元の権限は記録開始を妨げません。")
+                Text("記録は画面OCRから開始します。マイクをオンにしていても、「録音を開始」を選ぶまでは音声を入力しません。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -436,6 +473,16 @@ private struct SettingsView: View {
                 }
 
                 Text("Desklogが起動している間に実行されます。Macがスリープ中の場合は、復帰後に実行されます。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("外部操作") {
+                Toggle(
+                    "Raycastなどからの操作を許可",
+                    isOn: $controller.configuration.externalControlEnabled
+                )
+                Text("オンにすると、このMacのほかのアプリからdesklog:// URLで記録・録音・要約を操作できます。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -753,7 +800,7 @@ private struct PermissionSetupView: View {
             if controller.configuration.microphoneCaptureEnabled {
                 PermissionCard(
                     title: "マイク",
-                    detail: "周囲の会話をローカルWhisperで文字起こしします。一時音声は処理直後に削除し、文字起こしだけを保存します。",
+                    detail: "「録音を開始」している間だけ周囲の会話をローカルWhisperで文字起こしします。一時音声は処理直後に削除し、文字起こしだけを保存します。",
                     status: permissions.microphoneStatus
                 ) {
                     microphoneActions
@@ -766,8 +813,8 @@ private struct PermissionSetupView: View {
                 Label("記録を始める準備が完了しました", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                     .fontWeight(.semibold)
-            } else if !controller.captureReadiness.hasEnabledCaptureSource {
-                Label("設定で少なくとも1つの収集元をオンにしてください", systemImage: "exclamationmark.circle")
+            } else if !controller.configuration.screenCaptureEnabled {
+                Label("記録を始めるには設定で画面OCRをオンにしてください", systemImage: "exclamationmark.circle")
                     .foregroundStyle(.orange)
             }
         }
