@@ -60,4 +60,14 @@ public struct CaptureExclusionPolicy: Sendable, Equatable {
                 $0.bundleIdentifier.caseInsensitiveCompare(bundleIdentifier) == .orderedSame
         }
     }
+
+    /// Candidates must be supplied in front-to-back order. If the active
+    /// window is excluded, selection naturally falls through to the next one.
+    public func firstAllowed(
+        fromFrontToBack candidates: [ExcludedCaptureWindow]
+    ) -> ExcludedCaptureWindow? {
+        candidates.first {
+            !excludes(windowID: $0.windowID, bundleIdentifier: $0.bundleIdentifier)
+        }
+    }
 }

@@ -142,6 +142,23 @@ enum DesklogSelfTest {
         try require(!result.timeline.contains("最初の途中結果"), "stale speech snapshot remains")
         try require(result.timeline.contains("/tmp/editor.jpg"), "screenshot candidate is missing")
 
+        let chunks = try TimelineBuilder.buildSummaryChunks(
+            events: events + [
+                WorklogEvent(
+                    timestamp: start.addingTimeInterval(11 * 60),
+                    kind: .speechTranscript,
+                    text: "次の時間窓の発言"
+                )
+            ],
+            start: start,
+            end: start.addingTimeInterval(20 * 60)
+        )
+        try require(chunks.count == 2, "timeline was not split into ten-minute windows")
+        try require(
+            chunks[0].timeline.contains("[画面OCR]") && chunks[0].timeline.contains("[音声/"),
+            "OCR and speech were not interleaved in the first time window"
+        )
+
         let labeledSpeech = WorklogEvent(
             timestamp: start.addingTimeInterval(30),
             kind: .speechTranscript,

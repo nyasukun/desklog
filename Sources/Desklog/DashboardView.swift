@@ -235,7 +235,7 @@ private struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                Text("すべてのディスプレイを取得し、下で指定したウィンドウだけをOCRとスクリーンショットから除外します。")
+                Text("前面ウィンドウを1枚だけ取得します。除外対象なら、背面順の次のウィンドウを取得します。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -510,7 +510,7 @@ private struct SettingsView: View {
         if controller.configuration.excludedCaptureWindows.isEmpty {
             return "現在開いているウィンドウから、取得したくないものを選べます。記録中でも追加・削除できます。"
         }
-        return "指定したウィンドウは画面の画素から除外されます。変更は次回の取得から反映されます。ウィンドウを閉じて作り直した場合は、もう一度選んでください。"
+        return "指定したウィンドウは取得候補から外れ、前面から背面順の次候補へ進みます。変更は次回の取得から反映されます。ウィンドウを閉じて作り直した場合は、もう一度選んでください。"
     }
 
     private func removeExcludedCaptureWindow(_ window: ExcludedCaptureWindow) {
@@ -706,7 +706,7 @@ private struct PermissionSetupView: View {
             if controller.configuration.screenCaptureEnabled {
                 PermissionCard(
                     title: "画面収録",
-                    detail: "すべてのディスプレイをOCRし、設定で指定したウィンドウを画素から除外します。システム音声は取得しません。",
+                    detail: "前面から背面順に、除外されていない最初のウィンドウだけをOCRします。システム音声は取得しません。",
                     status: permissions.screenCaptureStatus
                 ) {
                     screenActions

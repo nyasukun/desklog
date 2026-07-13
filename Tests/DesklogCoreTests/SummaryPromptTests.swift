@@ -68,6 +68,47 @@ import Testing
         #expect(Set(SummaryPromptURLProtocol.requestHosts) == ["127.0.0.1"])
     }
 
+    @Test func chronologicalWindowsAreFoldedIntoThePreviousSummary() async throws {
+        SummaryPromptURLProtocol.reset(responseContent: "累積要約")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SummaryPromptURLProtocol.self]
+        let client = OllamaClient(
+            baseURL: "http://127.0.0.1:11434",
+            model: "gpt-oss:latest",
+            sessionConfiguration: configuration
+        )
+        let start = Date(timeIntervalSince1970: 0)
+        let inputs = [
+            SummaryInput(
+                start: start,
+                end: start.addingTimeInterval(10 * 60),
+                timeline: "[09:00:00][画面OCR] 設計画面\n[09:01:00][音声/Speaker-001] 方針を相談"
+            ),
+            SummaryInput(
+                start: start.addingTimeInterval(10 * 60),
+                end: start.addingTimeInterval(20 * 60),
+                timeline: "[09:10:00][音声/Speaker-001] 実装開始\n[09:11:00][画面OCR] テスト画面"
+            )
+        ]
+
+        let result = try await client.summarize(inputs)
+        let messages = SummaryPromptURLProtocol.userMessages
+        let bodies = SummaryPromptURLProtocol.requestBodies
+
+        #expect(result == "累積要約")
+        #expect(messages.count == 2)
+        #expect(messages[0].contains("設計画面") && messages[0].contains("方針を相談"))
+        #expect(messages[1].contains("累積要約"))
+        #expect(messages[1].contains("実装開始") && messages[1].contains("テスト画面"))
+        let firstBody = try #require(
+            JSONSerialization.jsonObject(with: bodies[0]) as? [String: Any]
+        )
+        let options = try #require(firstBody["options"] as? [String: Any])
+        #expect(firstBody["think"] as? String == "low")
+        #expect(options["num_ctx"] as? Int == 16_384)
+        #expect(options["num_predict"] as? Int == 2_048)
+    }
+
     @Test func nonCondensingModelCannotCauseAnUnboundedRequestLoop() async throws {
         let oversizedResponse = String(repeating: "長", count: 31_000)
         SummaryPromptURLProtocol.reset(responseContent: oversizedResponse)
@@ -99,6 +140,7 @@ private final class SummaryPromptURLProtocol: URLProtocol {
     private static let lock = NSLock()
     private static var messages: [String] = []
     private static var hosts: [String] = []
+    private static var bodies: [Data] = []
     private static var responseContent = "ローカル要約"
 
     static var userMessages: [String] {
@@ -113,10 +155,15 @@ private final class SummaryPromptURLProtocol: URLProtocol {
         lock.withLock { hosts.count }
     }
 
+    static var requestBodies: [Data] {
+        lock.withLock { bodies }
+    }
+
     static func reset(responseContent: String = "ローカル要約") {
         lock.withLock {
             messages.removeAll()
             hosts.removeAll()
+            bodies.removeAll()
             Self.responseContent = responseContent
         }
     }
@@ -130,10 +177,12 @@ private final class SummaryPromptURLProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
             return
         }
-        let message = Self.userMessage(from: request)
+        let requestBody = request.httpBody ?? request.httpBodyStream.flatMap(Self.readAll)
+        let message = requestBody.flatMap(Self.userMessage)
         Self.lock.withLock {
             if let host = url.host { Self.hosts.append(host) }
             if let message { Self.messages.append(message) }
+            if let requestBody { Self.bodies.append(requestBody) }
         }
         let content = Self.lock.withLock { Self.responseContent }
         let body = try! JSONSerialization.data(withJSONObject: [
@@ -152,10 +201,8 @@ private final class SummaryPromptURLProtocol: URLProtocol {
 
     override func stopLoading() {}
 
-    private static func userMessage(from request: URLRequest) -> String? {
-        let body = request.httpBody ?? request.httpBodyStream.flatMap(readAll)
-        guard let body,
-              let object = try? JSONSerialization.jsonObject(with: body),
+    private static func userMessage(from body: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: body),
               let dictionary = object as? [String: Any],
               let messages = dictionary["messages"] as? [[String: Any]] else {
             return nil

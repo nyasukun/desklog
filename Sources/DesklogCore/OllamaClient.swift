@@ -44,84 +44,78 @@ public struct OllamaClient: Sendable {
         _ input: SummaryInput,
         summaryPrompt: String = DesklogConfiguration.defaultSummaryPrompt
     ) async throws -> String {
+        try await summarize([input], summaryPrompt: summaryPrompt)
+    }
+
+    /// Progressively folds chronological worklog windows into one summary.
+    /// Each request contains only the summary so far and the next mixed OCR /
+    /// speech window, so the complete raw day never has to fit in one context.
+    public func summarize(
+        _ inputs: [SummaryInput],
+        summaryPrompt: String = DesklogConfiguration.defaultSummaryPrompt
+    ) async throws -> String {
         guard let base = URL(string: baseURL), Self.isAllowedLocalEndpoint(base) else {
             throw DesklogError.invalidOllamaURL
         }
+        guard !inputs.isEmpty else { throw DesklogError.noLogData }
 
         let instructions = Self.effectiveSummaryPrompt(summaryPrompt)
-        let chunks = Self.chunks(from: input.timeline, maximumCharacters: 18_000)
-        if chunks.count == 1 {
-            return try await chat(
-                base: base,
-                prompt: Self.prompt(for: input, summaryPrompt: instructions)
-            )
-        }
-
-        var condensed: [String] = []
-        for (index, chunk) in chunks.enumerated() {
-            let prompt = """
-            次のユーザー指定の要約指示を満たすために必要な事実を、ワークログ断片（\(index + 1)/\(chunks.count)）から抽出してください。
-            後段で全断片を統合するため、時刻、作業、発言、決定、TODOなど必要な文脈を重複なく簡潔な箇条書きにしてください。秘密情報らしき値は含めないでください。
-            図表、グラフ、スライド、設計図、UI配置など視覚情報が後段の要約に必要な場合は、対応する「スクリーンショット候補」の絶対パスを省略・変更せず残してください。
-            音声ログの話者名・Speaker ID・「（自分）」を保持し、誰の発言・担当かを区別してください。不明な話者の実名を推測しないでください。
-
-            --- ユーザー指定の要約指示 ---
-            \(instructions)
-            --- 要約指示終了 ---
-
-            --- ログ断片開始 ---
-            \(chunk)
-            --- ログ断片終了 ---
-            """
-            condensed.append(try await chat(base: base, prompt: prompt))
-        }
-
-        let maximumFinalInputCharacters = 30_000
-        let maximumConsolidationRounds = 3
-        var consolidationRound = 0
-        var previousCondensedLength = condensed.joined(separator: "\n\n").count
-        while previousCondensedLength > maximumFinalInputCharacters,
-              consolidationRound < maximumConsolidationRounds {
-            let groups = Self.chunks(
-                from: condensed.joined(separator: "\n\n"),
-                maximumCharacters: 24_000
-            )
-            var next: [String] = []
-            for group in groups {
-                next.append(try await chat(
-                    base: base,
-                    prompt: """
-                    次の部分要約を、ユーザー指定の要約指示を満たせる情報を失わないように統合してください。事実、時刻、話者名・Speaker ID・「（自分）」を維持し、不明な話者の実名は推測しないでください。視覚情報に必要なスクリーンショット候補の絶対パスは省略・変更しないでください。
-
-                    --- ユーザー指定の要約指示 ---
-                    \(instructions)
-                    --- 要約指示終了 ---
-
-                    --- 部分要約開始 ---
-                    \(group)
-                    --- 部分要約終了 ---
-                    """
-                ))
+        let rollingInputs = inputs.flatMap { input in
+            Self.chunks(
+                from: input.timeline,
+                maximumCharacters: TimelineBuilder.maximumSummaryChunkCharacters
+            ).map {
+                SummaryInput(start: input.start, end: input.end, timeline: $0)
             }
-            condensed = next
-            consolidationRound += 1
-            let nextLength = condensed.joined(separator: "\n\n").count
-            guard nextLength < previousCondensedLength else { break }
-            previousCondensedLength = nextLength
         }
-
-        let finalInput = SummaryInput(
-            start: input.start,
-            end: input.end,
-            timeline: Self.joinedAndBounded(
-                condensed,
-                maximumCharacters: maximumFinalInputCharacters
+        var summary: String?
+        for (index, input) in rollingInputs.enumerated() {
+            summary = try await chat(
+                base: base,
+                prompt: Self.rollingPrompt(
+                    previousSummary: summary,
+                    input: input,
+                    summaryPrompt: instructions,
+                    index: index,
+                    total: rollingInputs.count
+                )
             )
-        )
-        return try await chat(
-            base: base,
-            prompt: Self.prompt(for: finalInput, summaryPrompt: instructions)
-        )
+        }
+        guard let summary else { throw DesklogError.noLogData }
+        return summary
+    }
+
+    private static func rollingPrompt(
+        previousSummary: String?,
+        input: SummaryInput,
+        summaryPrompt: String,
+        index: Int,
+        total: Int
+    ) -> String {
+        let formatter = ISO8601DateFormatter()
+        let prior = previousSummary.map {
+            """
+            --- 直前までの累積要約開始 ---
+            \($0)
+            --- 直前までの累積要約終了 ---
+            """
+        } ?? "直前までの累積要約はありません。最初の時間窓から要約を作成してください。"
+        return """
+        音声と画面OCRを時系列に混在させた時間窓（\(index + 1)/\(total)）を、直前までの累積要約へ統合してください。
+        累積要約にある以前の事実を維持し、新しい時間窓の作業、発言、決定、TODOを時系列関係が分かるように追加してください。同じ内容は統合してください。
+        音声の話者名・Speaker ID・「（自分）」を保持し、不明な話者の実名は推測しないでください。必要なスクリーンショット候補の絶対パスは変更しないでください。
+        返答には更新後の累積要約だけを出力してください。秘密情報らしき値は含めないでください。
+
+        --- ユーザー指定の要約指示 ---
+        \(summaryPrompt)
+        --- 要約指示終了 ---
+
+        \(prior)
+
+        --- 次の時間窓開始（\(formatter.string(from: input.start)) 〜 \(formatter.string(from: input.end))） ---
+        \(input.timeline)
+        --- 次の時間窓終了 ---
+        """
     }
 
     private func chat(base: URL, prompt: String) async throws -> String {
@@ -136,7 +130,8 @@ public struct OllamaClient: Sendable {
                 .init(role: "user", content: prompt)
             ],
             stream: false,
-            options: .init(temperature: 0.2)
+            think: model.lowercased().contains("gpt-oss") ? .level("low") : .disabled,
+            options: .init(temperature: 0.2, numContext: 16_384, numPredict: 2_048)
         )
 
         var request = URLRequest(url: url)
@@ -156,7 +151,12 @@ public struct OllamaClient: Sendable {
         do {
             let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
             let value = decoded.message.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !value.isEmpty else { throw DesklogError.ollamaError("空の要約が返されました。") }
+            guard !value.isEmpty else {
+                if decoded.doneReason == "length" {
+                    throw DesklogError.ollamaError("モデルが要約本文を返す前に出力上限へ達しました。")
+                }
+                throw DesklogError.ollamaError("空の要約が返されました。")
+            }
             return value
         } catch let error as DesklogError {
             throw error
@@ -231,32 +231,6 @@ public struct OllamaClient: Sendable {
         return result.isEmpty ? [""] : result
     }
 
-    /// Keeps a fair prefix from every partial summary when a local model
-    /// ignores condensation instructions. This bounds the final context while
-    /// retaining coverage across the complete worklog instead of taking only
-    /// the beginning.
-    private static func joinedAndBounded(
-        _ sections: [String],
-        maximumCharacters: Int
-    ) -> String {
-        let joined = sections.joined(separator: "\n\n")
-        guard joined.count > maximumCharacters, maximumCharacters > 0 else { return joined }
-        guard !sections.isEmpty else { return "" }
-
-        var result = ""
-        for (index, section) in sections.enumerated() {
-            let sectionsRemaining = sections.count - index
-            let separatorsRemaining = max(0, sectionsRemaining - 1) * 2
-            let available = max(0, maximumCharacters - result.count - separatorsRemaining)
-            let allocation = available / sectionsRemaining
-            result += String(section.prefix(allocation))
-            if index < sections.count - 1, result.count + 2 <= maximumCharacters {
-                result += "\n\n"
-            }
-        }
-        return String(result.prefix(maximumCharacters))
-    }
-
     public static func effectiveSummaryPrompt(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let prompt = trimmed.isEmpty ? DesklogConfiguration.defaultSummaryPrompt : trimmed
@@ -299,6 +273,7 @@ private struct ChatRequest: Encodable {
     let model: String
     let messages: [Message]
     let stream: Bool
+    let think: ThinkingMode
     let options: Options
 
     struct Message: Codable {
@@ -308,11 +283,38 @@ private struct ChatRequest: Encodable {
 
     struct Options: Encodable {
         let temperature: Double
+        let numContext: Int
+        let numPredict: Int
+
+        enum CodingKeys: String, CodingKey {
+            case temperature
+            case numContext = "num_ctx"
+            case numPredict = "num_predict"
+        }
+    }
+
+    enum ThinkingMode: Encodable {
+        case disabled
+        case level(String)
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            switch self {
+            case .disabled: try container.encode(false)
+            case .level(let value): try container.encode(value)
+            }
+        }
     }
 }
 
 private struct ChatResponse: Decodable {
     let message: ChatRequest.Message
+    let doneReason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case message
+        case doneReason = "done_reason"
+    }
 }
 
 private struct VersionResponse: Decodable {

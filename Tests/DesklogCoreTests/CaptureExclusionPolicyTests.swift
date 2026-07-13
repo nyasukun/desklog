@@ -50,4 +50,23 @@ import Testing
         )
         #expect(window.displayTitle == "タイトルなし")
     }
+
+    @Test func excludedFrontmostWindowFallsThroughToNextWindow() {
+        let frontmost = ExcludedCaptureWindow(
+            windowID: 10,
+            bundleIdentifier: "com.example.Secret",
+            applicationName: "Secret",
+            windowTitle: "Private"
+        )
+        let next = ExcludedCaptureWindow(
+            windowID: 11,
+            bundleIdentifier: "com.example.Editor",
+            applicationName: "Editor",
+            windowTitle: "main.swift"
+        )
+        let policy = CaptureExclusionPolicy(windows: [frontmost])
+
+        #expect(policy.firstAllowed(fromFrontToBack: [frontmost, next]) == next)
+        #expect(policy.firstAllowed(fromFrontToBack: [frontmost]) == nil)
+    }
 }

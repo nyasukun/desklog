@@ -9,6 +9,8 @@ import Vision
 
 struct ScreenOCRResult: Sendable {
     let displayTitle: String
+    let windowID: UInt32
+    let bundleIdentifier: String
     let text: String
     let imagePath: String?
 }
@@ -95,74 +97,72 @@ final class ScreenOCRService: @unchecked Sendable {
         try ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        let excludedWindows = content.windows.filter { window in
-            guard let application = window.owningApplication else { return false }
-            return application.processID == ownPID || expectedPolicy.excludes(
-                windowID: window.windowID,
-                bundleIdentifier: application.bundleIdentifier
+        guard let window = Self.firstCaptureWindow(
+            in: content,
+            policy: expectedPolicy,
+            ownPID: ownPID
+        ), let application = window.owningApplication else {
+            return []
+        }
+
+        try ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let scale = max(1, CGFloat(filter.pointPixelScale))
+        let streamConfiguration = SCStreamConfiguration()
+        streamConfiguration.width = max(1, Int(filter.contentRect.width * scale))
+        streamConfiguration.height = max(1, Int(filter.contentRect.height * scale))
+        streamConfiguration.showsCursor = false
+        streamConfiguration.captureResolution = .best
+        streamConfiguration.shouldBeOpaque = true
+
+        let image: CGImage
+        do {
+            image = try await SCScreenshotManager.captureImage(
+                contentFilter: filter,
+                configuration: streamConfiguration
             )
-        }
-
-        var results: [ScreenOCRResult] = []
-        for (index, display) in content.displays.enumerated() {
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
             try ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
-            let filter = SCContentFilter(display: display, excludingWindows: excludedWindows)
-            let scale = max(1, CGFloat(filter.pointPixelScale))
-            let streamConfiguration = SCStreamConfiguration()
-            streamConfiguration.width = max(1, Int(filter.contentRect.width * scale))
-            streamConfiguration.height = max(1, Int(filter.contentRect.height * scale))
-            streamConfiguration.showsCursor = false
-            streamConfiguration.captureResolution = .best
-            streamConfiguration.shouldBeOpaque = true
+            throw DesklogError.screenContentUnavailable(error.localizedDescription)
+        }
+        try ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
+        let url = configuration.saveScreenshots
+            ? try await store.captureURL(at: timestamp)
+            : nil
+        let title = Self.captureTitle(for: window)
 
-            let image: CGImage
-            do {
-                image = try await SCScreenshotManager.captureImage(
-                    contentFilter: filter,
-                    configuration: streamConfiguration
-                )
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                try ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
-                throw DesklogError.screenContentUnavailable(error.localizedDescription)
+        let result = try await Task.detached(priority: .utility) {
+            var shouldKeepScreenshot = false
+            defer {
+                if !shouldKeepScreenshot, let url {
+                    try? FileManager.default.removeItem(at: url)
+                }
             }
-            try ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
-            let url = configuration.saveScreenshots
-                ? try await store.captureURL(at: timestamp)
-                : nil
-            let title = Self.displayTitle(displayID: display.displayID, fallbackIndex: index)
-
-            let result = try await Task.detached(priority: .utility) {
-                var shouldKeepScreenshot = false
-                defer {
-                    if !shouldKeepScreenshot, let url {
-                        try? FileManager.default.removeItem(at: url)
-                    }
+            try self.ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
+            let recognized = try Self.recognizeText(
+                in: image,
+                languages: configuration.ocrLanguages
+            )
+            if let url {
+                try attempt.performUnlessCancelled {
+                    try Self.saveJPEG(image, to: url)
                 }
-                try self.ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
-                let recognized = try Self.recognizeText(
-                    in: image,
-                    languages: configuration.ocrLanguages
-                )
-                if let url {
-                    try attempt.performUnlessCancelled {
-                        try Self.saveJPEG(image, to: url)
-                    }
-                }
-                try self.ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
-                let body = recognized.isEmpty ? "_OCRで文字を検出できませんでした。_" : recognized
-                let result = ScreenOCRResult(
-                    displayTitle: title,
-                    text: "## ディスプレイ: \(title)\n\n\(body)",
-                    imagePath: url?.path
-                )
-                shouldKeepScreenshot = true
-                return result
-            }.value
-            results.append(result)
-        }
-        return results
+            }
+            try self.ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
+            let body = recognized.isEmpty ? "_OCRで文字を検出できませんでした。_" : recognized
+            let result = ScreenOCRResult(
+                displayTitle: title,
+                windowID: window.windowID,
+                bundleIdentifier: application.bundleIdentifier,
+                text: "## ウィンドウ: \(title)\n\n\(body)",
+                imagePath: url?.path
+            )
+            shouldKeepScreenshot = true
+            return result
+        }.value
+        return [result]
     }
 
     private func ensurePolicyIsCurrent(
@@ -175,14 +175,61 @@ final class ScreenOCRService: @unchecked Sendable {
         }
     }
 
-    private static func displayTitle(displayID: CGDirectDisplayID, fallbackIndex: Int) -> String {
-        if let screen = NSScreen.screens.first(where: {
-            ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
-                .uint32Value == displayID
-        }) {
-            return screen.localizedName
+    private static func firstCaptureWindow(
+        in content: SCShareableContent,
+        policy: CaptureExclusionPolicy,
+        ownPID: pid_t
+    ) -> SCWindow? {
+        let eligible = content.windows.filter { window in
+            guard window.isOnScreen,
+                  window.windowLayer == 0,
+                  window.frame.width >= 80,
+                  window.frame.height >= 50,
+                  let application = window.owningApplication else {
+                return false
+            }
+            return application.processID != ownPID && !application.bundleIdentifier.isEmpty
         }
-        return "ディスプレイ \(fallbackIndex + 1)"
+        let byID = Dictionary(uniqueKeysWithValues: eligible.map { ($0.windowID, $0) })
+        var seen: Set<CGWindowID> = []
+        let ordered: [ExcludedCaptureWindow] = (
+            frontToBackWindowIDs() + eligible.map(\.windowID)
+        ).compactMap { windowID -> ExcludedCaptureWindow? in
+            guard seen.insert(windowID).inserted,
+                  let window = byID[windowID],
+                  let application = window.owningApplication else {
+                return nil
+            }
+            return ExcludedCaptureWindow(
+                windowID: window.windowID,
+                bundleIdentifier: application.bundleIdentifier,
+                applicationName: application.applicationName,
+                windowTitle: window.title ?? ""
+            )
+        }
+        guard let selection = policy.firstAllowed(fromFrontToBack: ordered) else { return nil }
+        return byID[selection.windowID]
+    }
+
+    /// Core Graphics returns on-screen windows in front-to-back order; the IDs
+    /// are then resolved to ScreenCaptureKit windows for the actual capture.
+    private static func frontToBackWindowIDs() -> [CGWindowID] {
+        guard let descriptions = CGWindowListCopyWindowInfo(
+            [.optionOnScreenOnly, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return []
+        }
+        return descriptions.compactMap {
+            ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+        }
+    }
+
+    private static func captureTitle(for window: SCWindow) -> String {
+        let applicationName = window.owningApplication?.applicationName
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "アプリ"
+        let windowTitle = window.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return windowTitle.isEmpty ? applicationName : "\(applicationName) — \(windowTitle)"
     }
 
     private static func recognizeText(in image: CGImage, languages: [String]) throws -> String {

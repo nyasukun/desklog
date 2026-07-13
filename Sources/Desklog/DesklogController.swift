@@ -261,7 +261,11 @@ final class DesklogController: ObservableObject {
                     return
                 }
                 guard !result.text.isEmpty else { continue }
-                var metadata = ["display_title": result.displayTitle]
+                var metadata = [
+                    "display_title": result.displayTitle,
+                    "window_id": String(result.windowID),
+                    "bundle_identifier": result.bundleIdentifier
+                ]
                 if let imagePath = result.imagePath {
                     metadata["image_path"] = imagePath
                 }
@@ -308,7 +312,7 @@ final class DesklogController: ObservableObject {
                 let start = end.addingTimeInterval(-Double(summaryConfiguration.summaryHours) * 3_600)
                 let events = try await store.events(from: start, to: end)
                 let profiles = try await speakerIdentityStore.profiles()
-                let input = try TimelineBuilder.build(
+                let inputs = try TimelineBuilder.buildSummaryChunks(
                     events: events,
                     start: start,
                     end: end,
@@ -319,7 +323,7 @@ final class DesklogController: ObservableObject {
                     model: summaryConfiguration.ollamaModel
                 )
                 let summary = try await client.summarize(
-                    input,
+                    inputs,
                     summaryPrompt: summaryConfiguration.summaryPrompt
                 )
                 let url = try await store.saveSummary(summary, at: end)
