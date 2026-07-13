@@ -116,9 +116,36 @@ private struct DashboardView: View {
                         .frame(width: 10, height: 10)
                     Text(controller.statusMessage).font(.title2.bold())
                     Spacer()
-                    if controller.isStarting || controller.isCapturing || controller.isSummarizing {
+                    if controller.isStarting || controller.isCapturing {
                         ProgressView().controlSize(.small)
                     }
+                }
+
+                if controller.isSummarizing {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ProgressView(
+                            value: Double(controller.summaryCompletedSteps),
+                            total: Double(max(1, controller.summaryTotalSteps))
+                        )
+                        .tint(.blue)
+
+                        HStack {
+                            Text(summaryProgressLabel)
+                            Spacer()
+                            if controller.summaryTotalSteps > 0 {
+                                Text(
+                                    "\(controller.summaryCompletedSteps) / " +
+                                        "\(controller.summaryTotalSteps)"
+                                )
+                                .monospacedDigit()
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("ワークログ要約の進捗")
+                    .accessibilityValue(summaryProgressLabel)
                 }
 
                 if controller.permissionSetupRequested || !controller.captureReadiness.canStart {
@@ -210,6 +237,14 @@ private struct DashboardView: View {
         if controller.isRunning { return "記録を停止" }
         if controller.isStarting { return "準備を中止" }
         return controller.captureReadiness.canStart ? "記録を開始" : "記録の準備"
+    }
+
+    private var summaryProgressLabel: String {
+        guard controller.summaryTotalSteps > 0 else { return "要約するログを準備中…" }
+        if controller.summaryCompletedSteps == controller.summaryTotalSteps {
+            return "要約を保存中…"
+        }
+        return "10分チャンクを累積要約中"
     }
 }
 

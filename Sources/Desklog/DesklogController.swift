@@ -9,6 +9,8 @@ final class DesklogController: ObservableObject {
     @Published private(set) var isTerminating = false
     @Published private(set) var isCapturing = false
     @Published private(set) var isSummarizing = false
+    @Published private(set) var summaryCompletedSteps = 0
+    @Published private(set) var summaryTotalSteps = 0
     @Published private(set) var isTestingOllama = false
     @Published private(set) var ollamaTestSucceeded: Bool?
     @Published private(set) var ollamaTestMessage = "未テスト"
@@ -296,6 +298,8 @@ final class DesklogController: ObservableObject {
     func summarize() {
         guard !isSummarizing, !isTerminating else { return }
         isSummarizing = true
+        summaryCompletedSteps = 0
+        summaryTotalSteps = 0
         beginPendingOperation()
         errorMessage = nil
         statusMessage = "Ollamaで要約中…"
@@ -324,7 +328,11 @@ final class DesklogController: ObservableObject {
                 )
                 let summary = try await client.summarize(
                     inputs,
-                    summaryPrompt: summaryConfiguration.summaryPrompt
+                    summaryPrompt: summaryConfiguration.summaryPrompt,
+                    progress: { [weak self] completed, total in
+                        self?.summaryCompletedSteps = completed
+                        self?.summaryTotalSteps = total
+                    }
                 )
                 let url = try await store.saveSummary(summary, at: end)
                 try await store.append(.init(

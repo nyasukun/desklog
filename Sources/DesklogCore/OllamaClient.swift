@@ -42,9 +42,10 @@ public struct OllamaClient: Sendable {
 
     public func summarize(
         _ input: SummaryInput,
-        summaryPrompt: String = DesklogConfiguration.defaultSummaryPrompt
+        summaryPrompt: String = DesklogConfiguration.defaultSummaryPrompt,
+        progress: (@MainActor @Sendable (_ completed: Int, _ total: Int) -> Void)? = nil
     ) async throws -> String {
-        try await summarize([input], summaryPrompt: summaryPrompt)
+        try await summarize([input], summaryPrompt: summaryPrompt, progress: progress)
     }
 
     /// Progressively folds chronological worklog windows into one summary.
@@ -52,7 +53,8 @@ public struct OllamaClient: Sendable {
     /// speech window, so the complete raw day never has to fit in one context.
     public func summarize(
         _ inputs: [SummaryInput],
-        summaryPrompt: String = DesklogConfiguration.defaultSummaryPrompt
+        summaryPrompt: String = DesklogConfiguration.defaultSummaryPrompt,
+        progress: (@MainActor @Sendable (_ completed: Int, _ total: Int) -> Void)? = nil
     ) async throws -> String {
         guard let base = URL(string: baseURL), Self.isAllowedLocalEndpoint(base) else {
             throw DesklogError.invalidOllamaURL
@@ -69,6 +71,7 @@ public struct OllamaClient: Sendable {
             }
         }
         var summary: String?
+        await progress?(0, rollingInputs.count)
         for (index, input) in rollingInputs.enumerated() {
             summary = try await chat(
                 base: base,
@@ -80,6 +83,7 @@ public struct OllamaClient: Sendable {
                     total: rollingInputs.count
                 )
             )
+            await progress?(index + 1, rollingInputs.count)
         }
         guard let summary else { throw DesklogError.noLogData }
         return summary

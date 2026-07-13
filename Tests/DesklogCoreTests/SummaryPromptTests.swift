@@ -68,7 +68,7 @@ import Testing
         #expect(Set(SummaryPromptURLProtocol.requestHosts) == ["127.0.0.1"])
     }
 
-    @Test func chronologicalWindowsAreFoldedIntoThePreviousSummary() async throws {
+    @Test @MainActor func chronologicalWindowsAreFoldedIntoThePreviousSummary() async throws {
         SummaryPromptURLProtocol.reset(responseContent: "累積要約")
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [SummaryPromptURLProtocol.self]
@@ -91,7 +91,13 @@ import Testing
             )
         ]
 
-        let result = try await client.summarize(inputs)
+        var progressUpdates: [(completed: Int, total: Int)] = []
+        let result = try await client.summarize(
+            inputs,
+            progress: { completed, total in
+                progressUpdates.append((completed, total))
+            }
+        )
         let messages = SummaryPromptURLProtocol.userMessages
         let bodies = SummaryPromptURLProtocol.requestBodies
 
@@ -100,6 +106,8 @@ import Testing
         #expect(messages[0].contains("設計画面") && messages[0].contains("方針を相談"))
         #expect(messages[1].contains("累積要約"))
         #expect(messages[1].contains("実装開始") && messages[1].contains("テスト画面"))
+        #expect(progressUpdates.map(\.completed) == [0, 1, 2])
+        #expect(progressUpdates.map(\.total) == [2, 2, 2])
         let firstBody = try #require(
             JSONSerialization.jsonObject(with: bodies[0]) as? [String: Any]
         )
