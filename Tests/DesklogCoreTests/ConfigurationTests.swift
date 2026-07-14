@@ -7,6 +7,7 @@ import Testing
         let data = Data(#"""
         {
           "screenCaptureMode":"automaticFrontmostWindows",
+          "screenCaptureResolution":"maximum",
           "excludedCaptureBundleIdentifiers":["com.example.Legacy"],
           "captureIntervalSeconds":60
         }
@@ -22,6 +23,7 @@ import Testing
             with: JSONEncoder().encode(configuration)
         ) as? [String: Any])
         #expect(encoded["screenCaptureMode"] == nil)
+        #expect(encoded["screenCaptureResolution"] == nil)
         #expect(encoded["excludedCaptureBundleIdentifiers"] == nil)
     }
 

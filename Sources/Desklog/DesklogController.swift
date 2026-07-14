@@ -2,6 +2,16 @@ import AppKit
 import DesklogCore
 import Foundation
 
+struct FailedOCRCaptureReview: Equatable {
+    let imagePath: String
+    let displayTitle: String
+    let windowID: UInt32
+    let bundleIdentifier: String
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let recognitionPass: OCRRecognitionPass
+}
+
 @MainActor
 final class DesklogController: ObservableObject {
     @Published private(set) var recordingMode: RecordingMode = .stopped
@@ -18,6 +28,12 @@ final class DesklogController: ObservableObject {
     @Published private(set) var nextScheduledSummaryAt: Date?
     @Published private(set) var lastCaptureAt: Date?
     @Published private(set) var latestOCR = ""
+    @Published private(set) var latestOCRNeedsReview = false
+    @Published private(set) var failedOCRCaptureReview: FailedOCRCaptureReview?
+    @Published private(set) var isRetryingOCR = false
+    @Published private(set) var ocrRetrySucceeded: Bool?
+    @Published private(set) var ocrRetryMessage = ""
+    @Published private(set) var ocrRetryCapture: FailedOCRCaptureReview?
     @Published private(set) var lastSummary = ""
     @Published private(set) var speakerProfiles: [SpeakerProfile] = []
     @Published private(set) var recentSpeakerObservations: [SpeakerObservation] = []
@@ -352,31 +368,177 @@ final class DesklogController: ObservableObject {
             finishPendingOperation()
         }
         let timestamp = Date()
-        var artifactTracker = CaptureArtifactTracker(urls: [])
         do {
             let results = try await screenOCR.capture(
                 store: store,
                 configuration: configuration,
                 at: timestamp
             )
-            artifactTracker = CaptureArtifactTracker(urls: results.compactMap { result in
-                result.imagePath.map { URL(fileURLWithPath: $0) }
-            })
-            guard captureAttemptID == attemptID else {
-                artifactTracker.discardUnpersisted()
+            try await persistCaptureResults(
+                results,
+                timestamp: timestamp,
+                attemptID: attemptID
+            )
+            guard captureAttemptID == attemptID else { return }
+            publishCaptureResults(results)
+            ocrRetryCapture = nil
+            ocrRetrySucceeded = nil
+            ocrRetryMessage = ""
+            lastCaptureAt = timestamp
+            statusMessage = isRunning ? currentRecordingStatus : "キャプチャ完了"
+        } catch is CancellationError {
+            // Stopping a recording intentionally cancels in-flight OCR without
+            // surfacing a misleading error or overwriting the stopped state.
+        } catch {
+            guard captureAttemptID == attemptID else { return }
+            fail(error, keepRunning: true)
+        }
+    }
+
+    func retryFailedOCRUntilRecognized(_ initialReview: FailedOCRCaptureReview) async {
+        guard !isTerminating, !isCapturing, !isRetryingOCR else { return }
+        guard configuration.screenCaptureEnabled else {
+            statusMessage = "画面OCRは設定でオフです"
+            return
+        }
+        if isRunning {
+            refreshPermissions()
+            guard isRunning else { return }
+        } else {
+            permissions.refresh()
+        }
+        guard permissions.screenCaptureStatus == .authorized else {
+            permissionSetupRequested = true
+            statusMessage = "画面収録の許可が必要です"
+            return
+        }
+
+        beginPendingOperation()
+        errorMessage = nil
+        isCapturing = true
+        isRetryingOCR = true
+        ocrRetrySucceeded = nil
+        ocrRetryCapture = initialReview
+        let attemptID = UUID()
+        captureAttemptID = attemptID
+        defer {
+            if captureAttemptID == attemptID { captureAttemptID = nil }
+            isCapturing = false
+            isRetryingOCR = false
+            finishPendingOperation()
+        }
+
+        do {
+            for (index, pass) in OCRRecognitionPass.retryPasses.enumerated() {
+                let retryAttempt = index + 1
+                ocrRetryMessage =
+                    "同じウィンドウを画面解像度で再取得し、" +
+                    "\(Self.recognitionPassLabel(pass))を解析中（\(retryAttempt)回目）…"
+                let timestamp = Date()
+                let results = try await screenOCR.capture(
+                    store: store,
+                    configuration: configuration,
+                    at: timestamp,
+                    targetWindowID: initialReview.windowID,
+                    targetBundleIdentifier: initialReview.bundleIdentifier,
+                    recognitionPass: pass
+                )
+                guard let targetResult = results.first(where: {
+                    $0.windowID == initialReview.windowID
+                }) else {
+                    discardUnpersistedCaptureImages(results)
+                    throw DesklogError.screenContentUnavailable(
+                        "確認したウィンドウを再取得できませんでした。"
+                    )
+                }
+                guard captureAttemptID == attemptID else {
+                    discardUnpersistedCaptureImages(results)
+                    throw CancellationError()
+                }
+
+                guard targetResult.didRecognizeText else {
+                    // A failed retry is only diagnostic work. Do not pollute
+                    // the worklog or leave an unreferenced private screenshot.
+                    discardUnpersistedCaptureImages(results)
+                    continue
+                }
+
+                try await persistCaptureResults(
+                    results,
+                    timestamp: timestamp,
+                    attemptID: attemptID,
+                    additionalMetadata: [
+                        "ocr_tile_retry": "true",
+                        "ocr_tile_retry_attempt": String(retryAttempt)
+                    ]
+                )
+                guard captureAttemptID == attemptID else { throw CancellationError() }
+                publishCaptureResults(results)
+                lastCaptureAt = timestamp
+                ocrRetrySucceeded = true
+                ocrRetryMessage =
+                    "OCRできました（\(targetResult.pixelWidth) × " +
+                    "\(targetResult.pixelHeight) px、画面解像度、" +
+                    "\(Self.recognitionPassLabel(pass))）。"
+                statusMessage = isRunning ? currentRecordingStatus : "OCR再取得完了"
                 return
             }
+
+            ocrRetrySucceeded = false
+            ocrRetryMessage =
+                "画面解像度の画像を最小タイルまで解析しましたが、文字を検出できませんでした。"
+            statusMessage = isRunning ? currentRecordingStatus : "字幕OCRを完了できませんでした"
+        } catch is CancellationError {
+            ocrRetrySucceeded = false
+            ocrRetryMessage = "OCRの再取得を中止しました。"
+        } catch {
+            guard captureAttemptID == attemptID else { return }
+            ocrRetrySucceeded = false
+            ocrRetryMessage = error.localizedDescription
+            fail(error, keepRunning: true)
+        }
+    }
+
+    func dismissFailedOCRReview() {
+        guard !isRetryingOCR else { return }
+        latestOCRNeedsReview = false
+        failedOCRCaptureReview = nil
+        ocrRetryCapture = nil
+        ocrRetrySucceeded = nil
+        ocrRetryMessage = ""
+    }
+
+    func prepareFailedOCRReview() {
+        guard !isRetryingOCR else { return }
+        ocrRetryCapture = failedOCRCaptureReview
+        ocrRetrySucceeded = nil
+        ocrRetryMessage = ""
+    }
+
+    private func persistCaptureResults(
+        _ results: [ScreenOCRResult],
+        timestamp: Date,
+        attemptID: UUID,
+        additionalMetadata: [String: String] = [:]
+    ) async throws {
+        var artifactTracker = CaptureArtifactTracker(urls: results.compactMap { result in
+            result.imagePath.map { URL(fileURLWithPath: $0) }
+        })
+        do {
+            guard captureAttemptID == attemptID else { throw CancellationError() }
             for result in results {
-                guard captureAttemptID == attemptID else {
-                    artifactTracker.discardUnpersisted()
-                    return
-                }
+                guard captureAttemptID == attemptID else { throw CancellationError() }
                 guard !result.text.isEmpty else { continue }
-                var metadata = [
+                var metadata = additionalMetadata.merging([
                     "display_title": result.displayTitle,
                     "window_id": String(result.windowID),
-                    "bundle_identifier": result.bundleIdentifier
-                ]
+                    "bundle_identifier": result.bundleIdentifier,
+                    "ocr_detected": String(result.didRecognizeText),
+                    "capture_resolution": "display_native",
+                    "ocr_recognition_pass": result.recognitionPass.rawValue,
+                    "pixel_width": String(result.pixelWidth),
+                    "pixel_height": String(result.pixelHeight)
+                ]) { _, captureValue in captureValue }
                 if let imagePath = result.imagePath {
                     metadata["image_path"] = imagePath
                 }
@@ -389,18 +551,46 @@ final class DesklogController: ObservableObject {
                 artifactTracker.markPersisted(result.imagePath.map { URL(fileURLWithPath: $0) })
             }
             artifactTracker.discardUnpersisted()
-            guard captureAttemptID == attemptID else { return }
-            latestOCR = results.map(\.text).joined(separator: "\n\n")
-            lastCaptureAt = timestamp
-            statusMessage = isRunning ? currentRecordingStatus : "キャプチャ完了"
-        } catch is CancellationError {
-            artifactTracker.discardUnpersisted()
-            // Stopping a recording intentionally cancels in-flight OCR without
-            // surfacing a misleading error or overwriting the stopped state.
         } catch {
             artifactTracker.discardUnpersisted()
-            guard captureAttemptID == attemptID else { return }
-            fail(error, keepRunning: true)
+            throw error
+        }
+    }
+
+    private func discardUnpersistedCaptureImages(_ results: [ScreenOCRResult]) {
+        var artifacts = CaptureArtifactTracker(urls: results.compactMap { result in
+            result.imagePath.map { URL(fileURLWithPath: $0) }
+        })
+        artifacts.discardUnpersisted()
+    }
+
+    private func publishCaptureResults(_ results: [ScreenOCRResult]) {
+        latestOCR = results.map(\.text).joined(separator: "\n\n")
+        latestOCRNeedsReview = results.contains { !$0.didRecognizeText }
+        failedOCRCaptureReview = results.first { result in
+            !result.didRecognizeText && result.imagePath != nil
+        }.flatMap { Self.captureReview(from: $0) }
+    }
+
+    private static func captureReview(from result: ScreenOCRResult) -> FailedOCRCaptureReview? {
+        guard let imagePath = result.imagePath else { return nil }
+        return FailedOCRCaptureReview(
+            imagePath: imagePath,
+            displayTitle: result.displayTitle,
+            windowID: result.windowID,
+            bundleIdentifier: result.bundleIdentifier,
+            pixelWidth: result.pixelWidth,
+            pixelHeight: result.pixelHeight,
+            recognitionPass: result.recognitionPass
+        )
+    }
+
+    private static func recognitionPassLabel(_ pass: OCRRecognitionPass) -> String {
+        switch pass {
+        case .fullFrame: return "画面全体"
+        case .largeTiles: return "大きな字幕タイル"
+        case .fineTiles: return "細かな字幕タイル"
+        case .smallestTiles: return "最小字幕タイル"
         }
     }
 

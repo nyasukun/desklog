@@ -124,6 +124,11 @@ private struct DashboardView: View {
     @ObservedObject var controller: DesklogController
     @ObservedObject private var speech: SpeechTranscriber
     @ObservedObject private var permissions: PermissionCoordinator
+    @State private var showsOCRImageReview = false
+    // Keep the review that opened this sheet stable while a retry publishes a
+    // newer capture. A successful retry clears the controller's failure state,
+    // but the sheet must remain able to show its success result and close.
+    @State private var ocrImageReview: FailedOCRCaptureReview?
 
     init(controller: DesklogController) {
         self.controller = controller
@@ -244,12 +249,28 @@ private struct DashboardView: View {
                 .opacity(controller.configuration.microphoneCaptureEnabled ? 1 : 0.55)
 
                 GroupBox("直近の画面OCR") {
-                    ScrollView {
-                        Text(controller.latestOCR.isEmpty ? "まだキャプチャされていません。" : controller.latestOCR)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
+                    VStack(alignment: .leading, spacing: 10) {
+                        ScrollView {
+                            Text(controller.latestOCR.isEmpty ? "まだキャプチャされていません。" : controller.latestOCR)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
+                        .frame(minHeight: 120, maxHeight: 220)
+
+                        if controller.latestOCRNeedsReview {
+                            OCRReviewNotice(
+                                hasSavedImage: controller.failedOCRCaptureReview != nil,
+                                onReview: {
+                                    ocrImageReview = controller.failedOCRCaptureReview
+                                    controller.prepareFailedOCRReview()
+                                    showsOCRImageReview = ocrImageReview != nil
+                                },
+                                onEnableSaving: {
+                                    controller.configuration.saveScreenshots = true
+                                }
+                            )
+                        }
                     }
-                    .frame(minHeight: 120, maxHeight: 220)
                 }
 
                 if !controller.lastSummary.isEmpty {
@@ -264,6 +285,14 @@ private struct DashboardView: View {
             .padding(24)
         }
         .navigationTitle("ワークログ")
+        .sheet(isPresented: $showsOCRImageReview) {
+            if let review = ocrImageReview {
+                OCRCaptureReviewSheet(controller: controller, review: review)
+            }
+        }
+        .onChange(of: showsOCRImageReview) { _, isPresented in
+            if !isPresented { ocrImageReview = nil }
+        }
     }
 
     private var primaryActionTitle: String {
@@ -282,6 +311,156 @@ private struct DashboardView: View {
             return "要約を保存中…"
         }
         return "10分チャンクを累積要約中"
+    }
+}
+
+private struct OCRReviewNotice: View {
+    let hasSavedImage: Bool
+    let onReview: () -> Void
+    let onEnableSaving: () -> Void
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Label(
+                "文字を検出できませんでした。元画像と取得解像度を確認してください。",
+                systemImage: "text.viewfinder"
+            )
+            .font(.callout)
+            .foregroundStyle(.orange)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if hasSavedImage {
+                Button("画像を確認", action: onReview)
+                    .buttonStyle(.borderedProminent)
+            } else {
+                Button("画像確認を有効にする", action: onEnableSaving)
+                    .help("次回から失敗時の画像を確認できるよう、スクリーンショット保存をオンにします")
+            }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct OCRCaptureReviewSheet: View {
+    @ObservedObject var controller: DesklogController
+    let review: FailedOCRCaptureReview
+    @Environment(\.dismiss) private var dismiss
+    @State private var zoom: CGFloat = 1
+
+    private var displayedReview: FailedOCRCaptureReview {
+        controller.ocrRetryCapture ?? review
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("OCR画像を確認")
+                        .font(.title2.bold())
+                    Text(review.displayTitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer()
+                Button("閉じる") { dismiss() }
+                    .disabled(controller.isRetryingOCR)
+            }
+
+            if let image = NSImage(contentsOfFile: displayedReview.imagePath) {
+                ScrollView([.horizontal, .vertical]) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(
+                            width: max(1, CGFloat(displayedReview.pixelWidth) * zoom),
+                            height: max(1, CGFloat(displayedReview.pixelHeight) * zoom)
+                        )
+                        .background(Color.white)
+                }
+                .frame(minHeight: 320)
+                .background(Color.black.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
+
+                HStack(spacing: 10) {
+                    Text("表示倍率")
+                    Slider(value: $zoom, in: 0.25...2, step: 0.25)
+                    Text("\(Int(zoom * 100))%")
+                        .monospacedDigit()
+                        .frame(width: 48, alignment: .trailing)
+                }
+                .font(.caption)
+            } else {
+                ContentUnavailableView(
+                    "画像を読み込めません",
+                    systemImage: "photo.badge.exclamationmark",
+                    description: Text(displayedReview.imagePath)
+                )
+                .frame(minHeight: 320)
+            }
+
+            HStack {
+                Label(
+                    "\(displayedReview.pixelWidth) × \(displayedReview.pixelHeight) px",
+                    systemImage: "rectangle.inset.filled"
+                )
+                Text("画面解像度に準拠")
+                Spacer()
+                Button("Finderで表示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([
+                        URL(fileURLWithPath: displayedReview.imagePath)
+                    ])
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("この画像にOCRしたい文字列がありますか？")
+                        .font(.headline)
+
+                    if controller.isRetryingOCR {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text(controller.ocrRetryMessage)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    } else if let succeeded = controller.ocrRetrySucceeded {
+                        Label(
+                            controller.ocrRetryMessage,
+                            systemImage: succeeded
+                                ? "checkmark.circle.fill"
+                                : "exclamationmark.triangle.fill"
+                        )
+                        .foregroundStyle(succeeded ? .green : .orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        Text("「はい」を選ぶと、このウィンドウを固定し、画面解像度のまま字幕領域を段階的に細かく切り出して、OCRできるまで直ちに再取得します。")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+
+                        HStack {
+                            Spacer()
+                            Button("いいえ") {
+                                controller.dismissFailedOCRReview()
+                                dismiss()
+                            }
+                            Button("はい、OCRできるまで再取得") {
+                                Task {
+                                    await controller.retryFailedOCRUntilRecognized(review)
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 820, minHeight: 620)
     }
 }
 
@@ -382,6 +561,9 @@ private struct SettingsView: View {
                     step: 10
                 )
                 .disabled(!controller.configuration.screenCaptureEnabled)
+                Text("画面はディスプレイのネイティブ解像度で取得します。字幕などの小さい文字は、解像度を変えずに画像をタイル分割してOCRします。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Toggle("スクリーンショットも保存", isOn: $controller.configuration.saveScreenshots)
                     .disabled(!controller.configuration.screenCaptureEnabled)
                 TextField("OCR言語（カンマ区切り）", text: ocrLanguagesBinding)

@@ -12,7 +12,11 @@ struct ScreenOCRResult: Sendable {
     let windowID: UInt32
     let bundleIdentifier: String
     let text: String
+    let didRecognizeText: Bool
     let imagePath: String?
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let recognitionPass: OCRRecognitionPass
 }
 
 final class ScreenOCRService: @unchecked Sendable {
@@ -69,7 +73,10 @@ final class ScreenOCRService: @unchecked Sendable {
     func capture(
         store: WorklogStore,
         configuration: DesklogConfiguration,
-        at timestamp: Date = Date()
+        at timestamp: Date = Date(),
+        targetWindowID: UInt32? = nil,
+        targetBundleIdentifier: String? = nil,
+        recognitionPass: OCRRecognitionPass = .fullFrame
     ) async throws -> [ScreenOCRResult] {
         guard CGPreflightScreenCaptureAccess() else {
             throw DesklogError.screenCapturePermissionRequired
@@ -97,11 +104,29 @@ final class ScreenOCRService: @unchecked Sendable {
         try ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
 
         let ownPID = ProcessInfo.processInfo.processIdentifier
-        guard let window = Self.firstCaptureWindow(
-            in: content,
-            policy: expectedPolicy,
-            ownPID: ownPID
-        ), let application = window.owningApplication else {
+        let selectedWindow: SCWindow?
+        if let targetWindowID {
+            selectedWindow = Self.captureWindow(
+                withID: targetWindowID,
+                bundleIdentifier: targetBundleIdentifier,
+                in: content,
+                policy: expectedPolicy,
+                ownPID: ownPID
+            )
+        } else {
+            selectedWindow = Self.firstCaptureWindow(
+                in: content,
+                policy: expectedPolicy,
+                ownPID: ownPID
+            )
+        }
+        guard let window = selectedWindow,
+              let application = window.owningApplication else {
+            if targetWindowID != nil {
+                throw DesklogError.screenContentUnavailable(
+                    "確認したウィンドウが閉じられたか、取得対象から外れました。"
+                )
+            }
             return []
         }
 
@@ -109,8 +134,8 @@ final class ScreenOCRService: @unchecked Sendable {
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let scale = max(1, CGFloat(filter.pointPixelScale))
         let streamConfiguration = SCStreamConfiguration()
-        streamConfiguration.width = max(1, Int(filter.contentRect.width * scale))
-        streamConfiguration.height = max(1, Int(filter.contentRect.height * scale))
+        streamConfiguration.width = max(1, Int((filter.contentRect.width * scale).rounded()))
+        streamConfiguration.height = max(1, Int((filter.contentRect.height * scale).rounded()))
         streamConfiguration.showsCursor = false
         streamConfiguration.captureResolution = .best
         streamConfiguration.shouldBeOpaque = true
@@ -143,7 +168,8 @@ final class ScreenOCRService: @unchecked Sendable {
             try self.ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
             let recognized = try Self.recognizeText(
                 in: image,
-                languages: configuration.ocrLanguages
+                languages: configuration.ocrLanguages,
+                pass: recognitionPass
             )
             if let url {
                 try attempt.performUnlessCancelled {
@@ -151,13 +177,20 @@ final class ScreenOCRService: @unchecked Sendable {
                 }
             }
             try self.ensurePolicyIsCurrent(expectedPolicy, attempt: attempt)
-            let body = recognized.isEmpty ? "_OCRで文字を検出できませんでした。_" : recognized
+            // A lone glyph such as "書©" is commonly a UI/icon false positive,
+            // not useful OCR output. Treat it as a miss so retry passes continue.
+            let didRecognizeText = Self.hasSubstantiveText(recognized)
+            let body = didRecognizeText ? recognized : "_OCRで文字を検出できませんでした。_"
             let result = ScreenOCRResult(
                 displayTitle: title,
                 windowID: window.windowID,
                 bundleIdentifier: application.bundleIdentifier,
                 text: "## ウィンドウ: \(title)\n\n\(body)",
-                imagePath: url?.path
+                didRecognizeText: didRecognizeText,
+                imagePath: url?.path,
+                pixelWidth: image.width,
+                pixelHeight: image.height,
+                recognitionPass: recognitionPass
             )
             shouldKeepScreenshot = true
             return result
@@ -181,14 +214,7 @@ final class ScreenOCRService: @unchecked Sendable {
         ownPID: pid_t
     ) -> SCWindow? {
         let eligible = content.windows.filter { window in
-            guard window.isOnScreen,
-                  window.windowLayer == 0,
-                  window.frame.width >= 80,
-                  window.frame.height >= 50,
-                  let application = window.owningApplication else {
-                return false
-            }
-            return application.processID != ownPID && !application.bundleIdentifier.isEmpty
+            isEligibleCaptureWindow(window, ownPID: ownPID)
         }
         let byID = Dictionary(uniqueKeysWithValues: eligible.map { ($0.windowID, $0) })
         var seen: Set<CGWindowID> = []
@@ -209,6 +235,39 @@ final class ScreenOCRService: @unchecked Sendable {
         }
         guard let selection = policy.firstAllowed(fromFrontToBack: ordered) else { return nil }
         return byID[selection.windowID]
+    }
+
+    private static func captureWindow(
+        withID windowID: UInt32,
+        bundleIdentifier: String?,
+        in content: SCShareableContent,
+        policy: CaptureExclusionPolicy,
+        ownPID: pid_t
+    ) -> SCWindow? {
+        guard let window = content.windows.first(where: { $0.windowID == windowID }),
+              isEligibleCaptureWindow(window, ownPID: ownPID),
+              let application = window.owningApplication,
+              bundleIdentifier == nil || application.bundleIdentifier.caseInsensitiveCompare(
+                  bundleIdentifier ?? ""
+              ) == .orderedSame,
+              !policy.excludes(
+                  windowID: window.windowID,
+                  bundleIdentifier: application.bundleIdentifier
+              ) else {
+            return nil
+        }
+        return window
+    }
+
+    private static func isEligibleCaptureWindow(_ window: SCWindow, ownPID: pid_t) -> Bool {
+        guard window.isOnScreen,
+              window.windowLayer == 0,
+              window.frame.width >= 80,
+              window.frame.height >= 50,
+              let application = window.owningApplication else {
+            return false
+        }
+        return application.processID != ownPID && !application.bundleIdentifier.isEmpty
     }
 
     /// Core Graphics returns on-screen windows in front-to-back order; the IDs
@@ -232,18 +291,105 @@ final class ScreenOCRService: @unchecked Sendable {
         return windowTitle.isEmpty ? applicationName : "\(applicationName) — \(windowTitle)"
     }
 
-    private static func recognizeText(in image: CGImage, languages: [String]) throws -> String {
+    private static func recognizeText(
+        in image: CGImage,
+        languages: [String],
+        pass: OCRRecognitionPass
+    ) throws -> String {
+        if pass == .fullFrame {
+            return try recognizedLines(in: image, languages: languages).joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        var seen: Set<String> = []
+        var recognized: [String] = []
+        let regions = OCRTileLayout.regions(
+            pixelWidth: image.width,
+            pixelHeight: image.height,
+            pass: pass
+        )
+        for region in regions {
+            try Task.checkCancellation()
+            let rect = CGRect(
+                x: region.x,
+                y: region.y,
+                width: region.width,
+                height: region.height
+            )
+            guard let crop = image.cropping(to: rect),
+                  let prepared = scaledImage(crop, by: pass.preprocessingScale) else {
+                continue
+            }
+            for line in try recognizedLines(
+                in: prepared,
+                languages: languages,
+                minimumTextHeight: 0.005
+            ) {
+                let key = line.folding(
+                    options: [.caseInsensitive, .widthInsensitive],
+                    locale: .current
+                ).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !key.isEmpty, seen.insert(key).inserted else { continue }
+                recognized.append(line)
+            }
+        }
+        return recognized.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func recognizedLines(
+        in image: CGImage,
+        languages: [String],
+        minimumTextHeight: Float? = nil
+    ) throws -> [String] {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
         request.recognitionLanguages = languages
+        if let minimumTextHeight {
+            request.minimumTextHeight = minimumTextHeight
+        }
         let handler = VNImageRequestHandler(cgImage: image, orientation: .up)
         try handler.perform([request])
 
         return (request.results ?? [])
             .compactMap { $0.topCandidates(1).first?.string }
-            .joined(separator: "\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func hasSubstantiveText(_ text: String) -> Bool {
+        text.unicodeScalars.reduce(into: 0) { count, scalar in
+            if CharacterSet.letters.contains(scalar) || CharacterSet.decimalDigits.contains(scalar) {
+                count += 1
+            }
+        } >= 2
+    }
+
+    private static func scaledImage(_ image: CGImage, by factor: Int) -> CGImage? {
+        guard factor > 1 else { return image }
+        guard let context = CGContext(
+            data: nil,
+            width: image.width * factor,
+            height: image.height * factor,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+        context.interpolationQuality = .high
+        context.draw(
+            image,
+            in: CGRect(
+                x: 0,
+                y: 0,
+                width: image.width * factor,
+                height: image.height * factor
+            )
+        )
+        return context.makeImage()
     }
 
     private static func saveJPEG(_ image: CGImage, to url: URL) throws {
@@ -255,7 +401,7 @@ final class ScreenOCRService: @unchecked Sendable {
         ) else {
             throw DesklogError.screenCaptureFailed
         }
-        let properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.72]
+        let properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.92]
         CGImageDestinationAddImage(destination, image, properties as CFDictionary)
         guard CGImageDestinationFinalize(destination) else {
             throw DesklogError.screenCaptureFailed
