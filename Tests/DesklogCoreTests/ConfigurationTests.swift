@@ -16,6 +16,7 @@ import Testing
         let configuration = try JSONDecoder().decode(DesklogConfiguration.self, from: data)
         #expect(configuration.screenCaptureEnabled)
         #expect(configuration.microphoneCaptureEnabled)
+        #expect(!configuration.webexCollectionEnabled)
         #expect(!configuration.externalControlEnabled)
         #expect(configuration.excludedCaptureWindows.isEmpty)
 
@@ -30,6 +31,7 @@ import Testing
     @Test func captureSourceSelectionsAndExcludedWindowsRoundTrip() throws {
         var configuration = DesklogConfiguration()
         configuration.screenCaptureEnabled = false
+        configuration.webexCollectionEnabled = true
         configuration.externalControlEnabled = true
         configuration.excludedCaptureWindows = [
             .init(windowID: 123, bundleIdentifier: "com.apple.Safari", applicationName: "Safari", windowTitle: "Private"),
@@ -41,6 +43,7 @@ import Testing
             from: JSONEncoder().encode(configuration)
         )
         #expect(decoded == configuration)
+        #expect(decoded.webexCollectionEnabled)
         #expect(decoded.externalControlEnabled)
         #expect(decoded.excludesCaptureWindow(windowID: 123, bundleIdentifier: "COM.APPLE.SAFARI"))
         #expect(!decoded.excludesCaptureWindow(windowID: 124, bundleIdentifier: "com.apple.Safari"))
@@ -66,6 +69,25 @@ import Testing
         )
         #expect(decoded.summaryPrompt == configuration.summaryPrompt)
         #expect(decoded == configuration)
+    }
+
+    @Test func defaultSummaryPromptIncludesEveryCollectedSource() {
+        let prompt = DesklogConfiguration.defaultSummaryPrompt
+
+        #expect(prompt.contains("画面OCR"))
+        #expect(prompt.contains("マイク音声認識"))
+        #expect(prompt.contains("Webex会話"))
+    }
+
+    @Test func configurationNeverPersistsAWebexCredentialField() throws {
+        let encoded = try #require(JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(DesklogConfiguration(webexCollectionEnabled: true))
+        ) as? [String: Any])
+
+        #expect(encoded["webexCollectionEnabled"] as? Bool == true)
+        #expect(encoded["webexAccessToken"] == nil)
+        #expect(encoded["webexAccessKey"] == nil)
+        #expect(encoded["accessToken"] == nil)
     }
 
     @Test func summaryPromptLengthIsBounded() {

@@ -99,13 +99,19 @@ import Testing
         ]
         let files = try runtimeRoots.flatMap(swiftFiles(in:))
 
+        let reviewedNetworkClients = ["OllamaClient.swift", "WebexClient.swift"]
         for file in files {
             let source = try String(contentsOf: file, encoding: .utf8)
-            #expect(!source.contains("https://"), "Runtime source contains a remote URL: \(file.path)")
-            if file.lastPathComponent != "OllamaClient.swift" {
+            if source.contains("https://") {
                 #expect(
-                    !source.contains("URLSession"),
-                    "Network transport exists outside the loopback-only client: \(file.path)"
+                    file.lastPathComponent == "WebexClient.swift",
+                    "Runtime source contains an unreviewed remote URL: \(file.path)"
+                )
+            }
+            if !reviewedNetworkClients.contains(file.lastPathComponent) {
+                #expect(
+                    !source.contains("URLSession("),
+                    "Network transport exists outside a reviewed client: \(file.path)"
                 )
             }
             if source.contains("Process()") {
@@ -176,6 +182,21 @@ import Testing
         #expect(ollamaSource.contains("completionHandler(nil)"))
         #expect(ollamaSource.contains("connectionProxyDictionary = [:]"))
 
+        let webexSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/DesklogCore/WebexClient.swift"),
+            encoding: .utf8
+        )
+        #expect(webexSource.contains(#"https://webexapis.com/v1"#))
+        #expect(webexSource.contains(
+            #"https://developer.webex.com/docs/getting-your-personal-access-token"#
+        ))
+        #expect(webexSource.contains(#"host == "webexapis.com" || host.hasSuffix(".webexapis.com")"#))
+        #expect(webexSource.contains(#"host == "api.ciscospark.com""#))
+        #expect(!webexSource.contains(#"hasSuffix(".ciscospark.com")"#))
+        #expect(webexSource.contains("completionHandler(nil)"))
+        #expect(webexSource.contains(#"request.setValue("Bearer \(accessToken)""#))
+        #expect(!webexSource.contains("print(accessToken)"))
+
         let installerSource = try String(
             contentsOf: root.appendingPathComponent("Sources/DesklogModelSetup/main.swift"),
             encoding: .utf8
@@ -195,6 +216,23 @@ import Testing
                 "Sensitive audio data would be written to the worklog: \(forbiddenMetadataKey)"
             )
         }
+    }
+
+    @Test func webexTokenEntryRemainsAVisibleDedicatedScreen() throws {
+        let source = try String(
+            contentsOf: repositoryRoot.appendingPathComponent(
+                "Sources/Desklog/DashboardView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        #expect(source.contains(#"case webex = "Webex""#))
+        #expect(source.contains("Webex Personal Access Token"))
+        #expect(source.contains("取得したトークンをここに貼り付け"))
+        #expect(source.contains(".textFieldStyle(.roundedBorder)"))
+        #expect(source.contains(#".accessibilityLabel("Webexアクセストークン")"#))
+        #expect(source.contains("診断ログをFinderで表示"))
+        #expect(source.contains("controller.webexDiagnosticLogPath"))
     }
 
     private func makeSpySessionConfiguration() -> URLSessionConfiguration {

@@ -25,6 +25,14 @@ final class DesklogController: ObservableObject {
     @Published private(set) var isTestingOllama = false
     @Published private(set) var ollamaTestSucceeded: Bool?
     @Published private(set) var ollamaTestMessage = "未テスト"
+    @Published private(set) var hasWebexCredential = false
+    @Published private(set) var isAuthenticatingWebex = false
+    @Published private(set) var isSyncingWebex = false
+    @Published private(set) var webexConnectionFailed = false
+    @Published private(set) var webexSyncWarning = false
+    @Published private(set) var webexStatusMessage = "未認証"
+    @Published private(set) var lastWebexSyncAt: Date?
+    @Published private(set) var lastWebexDiagnosticID: String?
     @Published private(set) var nextScheduledSummaryAt: Date?
     @Published private(set) var lastCaptureAt: Date?
     @Published private(set) var latestOCR = ""
@@ -63,14 +71,20 @@ final class DesklogController: ObservableObject {
                 configuration.summaryScheduleMinute != oldValue.summaryScheduleMinute {
                 restartSummaryScheduler()
             }
+            if configuration.webexCollectionEnabled != oldValue.webexCollectionEnabled {
+                restartWebexCollector()
+            }
         }
     }
 
     let speechTranscriber = SpeechTranscriber()
     let permissions = PermissionCoordinator()
     let store: WorklogStore
+    private let webexSyncService: WebexSyncService
+    private let webexDiagnosticLogger: WebexDiagnosticLogger
     private let speakerIdentityStore = SpeakerIdentityStore()
     private let configurationStore = ConfigurationStore()
+    private let webexCredentialStore = WebexCredentialStore()
     private let screenOCR = ScreenOCRService()
     private var captureLoop: Task<Void, Never>?
     private var summarySchedulerTask: Task<Void, Never>?
@@ -80,10 +94,13 @@ final class DesklogController: ObservableObject {
     private var pendingOperations = 0
     private var summaryTask: Task<Void, Never>?
     private var ollamaTestTask: Task<Void, Never>?
+    private var webexAuthenticationTask: Task<Void, Never>?
+    private var webexPollingTask: Task<Void, Never>?
     private var processActivity: NSObjectProtocol?
     private var applicationActiveObserver: NSObjectProtocol?
     private var audioAlertSnoozeState = AudioAlertSnoozeState()
     private var audioAlertRestoreTasks: [AudioAlertKind: Task<Void, Never>] = [:]
+    private static let webexPollingIntervalNanoseconds: UInt64 = 60_000_000_000
 
     var isRunning: Bool {
         recordingMode != .stopped
@@ -103,7 +120,14 @@ final class DesklogController: ObservableObject {
 
     init() {
         configuration = configurationStore.load()
-        store = WorklogStore()
+        let store = WorklogStore()
+        let webexDiagnosticLogger = WebexDiagnosticLogger()
+        self.store = store
+        self.webexDiagnosticLogger = webexDiagnosticLogger
+        webexSyncService = WebexSyncService(
+            store: store,
+            diagnosticLogger: webexDiagnosticLogger
+        )
         screenOCR.updateCaptureExclusionPolicy(desklogConfiguration: configuration)
         Task {
             try? await store.prepare()
@@ -134,10 +158,18 @@ final class DesklogController: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.refreshPermissions()
+                guard let self else { return }
+                self.refreshPermissions()
+                if self.configuration.webexCollectionEnabled,
+                   self.hasWebexCredential,
+                   !self.isSyncingWebex {
+                    self.restartWebexCollector(trigger: .automatic)
+                }
             }
         }
         restartSummaryScheduler()
+        loadWebexCredentialState()
+        restartWebexCollector()
     }
 
     func start() {
@@ -329,6 +361,10 @@ final class DesklogController: ObservableObject {
         }
         summaryTask?.cancel()
         ollamaTestTask?.cancel()
+        webexAuthenticationTask?.cancel()
+        webexPollingTask?.cancel()
+        webexAuthenticationTask = nil
+        webexPollingTask = nil
         await speechTranscriber.finishPendingTranscriptionsForTermination()
         // ScreenCaptureKit/Vision do not promise that an in-flight system call
         // will react to Swift task cancellation. Give local persistence a short,
@@ -791,6 +827,168 @@ final class DesklogController: ObservableObject {
         }
     }
 
+    func openWebexAccessTokenPage() {
+        NSWorkspace.shared.open(WebexAPIClient.personalAccessTokenURL)
+    }
+
+    func connectWebex(accessToken value: String) {
+        guard !isAuthenticatingWebex, !isTerminating else { return }
+        let token = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else {
+            webexConnectionFailed = true
+            webexStatusMessage = "Webexアクセストークンを入力してください"
+            return
+        }
+
+        webexAuthenticationTask?.cancel()
+        let diagnosticSyncID = WebexDiagnosticLogger.makeSyncID()
+        let authenticationStartedAt = Date()
+        lastWebexDiagnosticID = diagnosticSyncID.displayValue
+        isAuthenticatingWebex = true
+        webexConnectionFailed = false
+        webexSyncWarning = false
+        webexStatusMessage = "Webexの認証を確認中…"
+        beginPendingOperation()
+        webexAuthenticationTask = Task { [weak self] in
+            guard let self else { return }
+            await self.recordWebexDiagnostic(.syncStarted(
+                syncID: diagnosticSyncID,
+                trigger: .authentication
+            ))
+            await self.recordWebexDiagnostic(.operationStarted(
+                syncID: diagnosticSyncID,
+                operation: .authentication,
+                attempt: 1,
+                page: nil,
+                roomOrdinal: nil
+            ))
+            defer {
+                self.isAuthenticatingWebex = false
+                self.webexAuthenticationTask = nil
+                self.finishPendingOperation()
+            }
+            do {
+                let identity = try await WebexAPIClient(accessToken: token).identity()
+                try Task.checkCancellation()
+                try self.webexCredentialStore.save(token)
+                self.hasWebexCredential = true
+                self.webexConnectionFailed = false
+                self.webexSyncWarning = false
+                await self.recordWebexDiagnostic(.operationCompleted(
+                    syncID: diagnosticSyncID,
+                    operation: .authentication,
+                    statusCode: 200,
+                    itemCount: 1,
+                    durationMilliseconds: Self.webexDurationMilliseconds(
+                        since: authenticationStartedAt
+                    )
+                ))
+                await self.recordWebexDiagnostic(.syncCompleted(
+                    syncID: diagnosticSyncID,
+                    conversationCount: 0,
+                    messageCount: 0,
+                    downloadedAttachmentCount: 0,
+                    pendingAttachmentCount: 0,
+                    durationMilliseconds: Self.webexDurationMilliseconds(
+                        since: authenticationStartedAt
+                    )
+                ))
+                let name = identity.displayName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let name, !name.isEmpty {
+                    self.webexStatusMessage = "認証済み（\(name)）。同期を開始します…"
+                } else {
+                    self.webexStatusMessage = "認証済み。同期を開始します…"
+                }
+                if self.configuration.webexCollectionEnabled {
+                    self.restartWebexCollector()
+                } else {
+                    self.configuration.webexCollectionEnabled = true
+                }
+            } catch is CancellationError {
+                await self.recordWebexDiagnostic(.syncCancelled(
+                    syncID: diagnosticSyncID,
+                    operation: .authentication
+                ))
+                return
+            } catch {
+                self.webexConnectionFailed = true
+                self.webexSyncWarning = false
+                self.webexStatusMessage = Self.webexErrorMessage(error)
+                    + " [診断ID: \(diagnosticSyncID.displayValue)]"
+                await self.recordWebexDiagnostic(.syncFailed(
+                    syncID: diagnosticSyncID,
+                    operation: .authentication,
+                    errorCode: WebexDiagnosticLogger.safeErrorCode(for: error),
+                    statusCode: WebexDiagnosticLogger.safeStatusCode(for: error),
+                    retryAfterSeconds: WebexDiagnosticLogger.safeRetryAfterSeconds(for: error)
+                ))
+            }
+        }
+    }
+
+    func disconnectWebex() {
+        guard !isTerminating else { return }
+        webexAuthenticationTask?.cancel()
+        webexAuthenticationTask = nil
+        webexPollingTask?.cancel()
+        webexPollingTask = nil
+        if configuration.webexCollectionEnabled {
+            configuration.webexCollectionEnabled = false
+        }
+        do {
+            try webexCredentialStore.delete()
+            hasWebexCredential = false
+            isAuthenticatingWebex = false
+            isSyncingWebex = false
+            webexConnectionFailed = false
+            webexSyncWarning = false
+            webexStatusMessage = "未認証"
+        } catch {
+            webexConnectionFailed = true
+            webexSyncWarning = false
+            webexStatusMessage = error.localizedDescription
+        }
+    }
+
+    func syncWebexNow() {
+        guard configuration.webexCollectionEnabled,
+              hasWebexCredential,
+              !isAuthenticatingWebex,
+              !isSyncingWebex,
+              !isTerminating else { return }
+        restartWebexCollector(trigger: .manual)
+    }
+
+    var webexDiagnosticLogPath: String {
+        webexDiagnosticLogger.logURL.path
+    }
+
+    func revealWebexDiagnosticLog() {
+        let logURL = webexDiagnosticLogger.logURL
+        let directoryURL = logURL.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(
+                at: directoryURL,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: directoryURL.path
+            )
+        } catch {
+            webexConnectionFailed = true
+            webexSyncWarning = false
+            webexStatusMessage = "Webex診断ログの保存先を開けません。"
+            return
+        }
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([logURL])
+        } else {
+            NSWorkspace.shared.open(directoryURL)
+        }
+    }
+
     func labelSpeaker(observationID: UUID, name: String, isSelf: Bool) {
         guard !isUpdatingSpeaker, !isTerminating else { return }
         isUpdatingSpeaker = true
@@ -879,6 +1077,205 @@ final class DesklogController: ObservableObject {
                 }
             }
         }
+    }
+
+    private func loadWebexCredentialState() {
+        do {
+            hasWebexCredential = try webexCredentialStore.load() != nil
+            webexConnectionFailed = false
+            webexSyncWarning = false
+            webexStatusMessage = hasWebexCredential
+                ? (configuration.webexCollectionEnabled ? "認証済み。同期を開始します…" : "認証済み（収集停止）")
+                : "未認証"
+            if !hasWebexCredential, configuration.webexCollectionEnabled {
+                configuration.webexCollectionEnabled = false
+            }
+        } catch {
+            hasWebexCredential = false
+            webexConnectionFailed = true
+            webexSyncWarning = false
+            webexStatusMessage = error.localizedDescription
+            if configuration.webexCollectionEnabled {
+                configuration.webexCollectionEnabled = false
+            }
+        }
+    }
+
+    private func restartWebexCollector(
+        trigger: WebexDiagnosticTrigger = .automatic
+    ) {
+        webexPollingTask?.cancel()
+        webexPollingTask = nil
+        guard !isTerminating else { return }
+        guard configuration.webexCollectionEnabled else {
+            webexSyncWarning = false
+            if hasWebexCredential, !isAuthenticatingWebex {
+                webexStatusMessage = "認証済み（収集停止）"
+            }
+            return
+        }
+        guard hasWebexCredential else {
+            webexConnectionFailed = true
+            webexSyncWarning = false
+            webexStatusMessage = "収集を始めるにはWebex認証が必要です"
+            configuration.webexCollectionEnabled = false
+            return
+        }
+
+        webexPollingTask = Task { [weak self] in
+            guard let self else { return }
+            var nextTrigger = trigger
+            while !Task.isCancelled {
+                await self.performWebexSync(trigger: nextTrigger)
+                nextTrigger = .automatic
+                guard !Task.isCancelled,
+                      self.configuration.webexCollectionEnabled else { return }
+                do {
+                    try await Task.sleep(nanoseconds: Self.webexPollingIntervalNanoseconds)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    private func performWebexSync(trigger: WebexDiagnosticTrigger) async {
+        guard !isSyncingWebex, !isTerminating else { return }
+        let diagnosticSyncID = WebexDiagnosticLogger.makeSyncID()
+        let synchronizationStartedAt = Date()
+        lastWebexDiagnosticID = diagnosticSyncID.displayValue
+        await recordWebexDiagnostic(.syncStarted(
+            syncID: diagnosticSyncID,
+            trigger: trigger
+        ))
+        let token: String
+        do {
+            guard let stored = try webexCredentialStore.load() else {
+                throw WebexCredentialError.invalidStoredCredential
+            }
+            token = stored
+        } catch {
+            hasWebexCredential = false
+            webexConnectionFailed = true
+            webexSyncWarning = false
+            webexStatusMessage = error.localizedDescription
+            await recordWebexDiagnostic(.syncFailed(
+                syncID: diagnosticSyncID,
+                operation: .authentication,
+                errorCode: WebexDiagnosticLogger.safeErrorCode(for: error),
+                statusCode: WebexDiagnosticLogger.safeStatusCode(for: error),
+                retryAfterSeconds: WebexDiagnosticLogger.safeRetryAfterSeconds(for: error)
+            ))
+            if configuration.webexCollectionEnabled {
+                configuration.webexCollectionEnabled = false
+            }
+            return
+        }
+
+        isSyncingWebex = true
+        webexConnectionFailed = false
+        webexSyncWarning = false
+        webexStatusMessage = "Webexの当日ログを同期中…"
+        beginPendingOperation()
+        defer {
+            isSyncingWebex = false
+            finishPendingOperation()
+        }
+        do {
+            let report = try await webexSyncService.synchronize(
+                accessToken: token,
+                diagnosticSyncID: diagnosticSyncID
+            )
+            try Task.checkCancellation()
+            lastWebexSyncAt = Date()
+            webexConnectionFailed = false
+            webexSyncWarning = report.failedRoomCount > 0 || report.pendingAttachmentCount > 0
+            var message = report.failedRoomCount > 0 ? "一部同期完了" : "同期完了"
+            message += ": \(report.conversationCount)件の会話、\(report.messageCount)件のメッセージ"
+            if report.downloadedAttachmentCount > 0 {
+                message += "、添付\(report.downloadedAttachmentCount)件を保存"
+            }
+            if report.failedRoomCount > 0 {
+                message += "（\(report.failedRoomCount)ルームは取得失敗、次回再試行"
+                if report.preservedConversationCount > 0 {
+                    message += "・既存\(report.preservedConversationCount)件を保持"
+                }
+                message += "）"
+            }
+            if report.pendingAttachmentCount > 0 {
+                message += "（添付\(report.pendingAttachmentCount)件は次回再試行）"
+            }
+            message += " [診断ID: \(diagnosticSyncID.displayValue)]"
+            webexStatusMessage = message
+            await recordWebexDiagnostic(.syncCompleted(
+                syncID: diagnosticSyncID,
+                conversationCount: report.conversationCount,
+                messageCount: report.messageCount,
+                downloadedAttachmentCount: report.downloadedAttachmentCount,
+                pendingAttachmentCount: report.pendingAttachmentCount,
+                durationMilliseconds: Self.webexDurationMilliseconds(
+                    since: synchronizationStartedAt
+                )
+            ))
+        } catch is CancellationError {
+            await recordWebexDiagnostic(.syncCancelled(
+                syncID: diagnosticSyncID,
+                operation: .messages
+            ))
+            return
+        } catch {
+            let failureMessage = Self.webexErrorMessage(error)
+                + " [診断ID: \(diagnosticSyncID.displayValue)]"
+            if case WebexAPIError.unauthorized = error {
+                configuration.webexCollectionEnabled = false
+            } else if case WebexAPIError.forbidden = error {
+                configuration.webexCollectionEnabled = false
+            }
+            webexConnectionFailed = true
+            webexSyncWarning = false
+            webexStatusMessage = failureMessage
+        }
+    }
+
+    private static func webexErrorMessage(_ error: Error) -> String {
+        guard let error = error as? WebexAPIError else {
+            return "Webex処理に失敗しました: \(error.localizedDescription)"
+        }
+        switch error {
+        case .invalidAccessToken, .unauthorized:
+            return "Webexの認証期限が切れているか、アクセストークンが無効です。再認証してください。"
+        case .forbidden:
+            return "Webexメッセージを読む権限がありません。アクセストークンを再発行してください。"
+        case .rateLimited(let retryAfter):
+            if let retryAfter {
+                return "Webex APIの利用上限に達しました。約\(Int(ceil(retryAfter)))秒後に再試行します。"
+            }
+            return "Webex APIの利用上限に達しました。次回の同期で再試行します。"
+        case .transport:
+            return "Webexへ接続できません。ネットワークを確認してください。"
+        case .attachmentLocked:
+            return "Webexが添付ファイルを検査中です。次回の同期で再試行します。"
+        case .attachmentUnavailable:
+            return "Webexで安全ではないと判定された添付ファイルは取得できません。"
+        case .attachmentRequiresUserConsent:
+            return "Webexで検査できない添付ファイルが強制取得にも応じませんでした。次回の同期で再試行します。"
+        case .invalidBaseURL, .unsafePaginationURL, .unsafeAttachmentURL, .paginationLoop,
+             .tooManyRedirects:
+            return "安全ではないWebex API応答を拒否しました。"
+        case .invalidDateRange, .invalidResponse, .malformedResponse, .httpStatus,
+             .invalidFileDestination, .fileWriteFailed:
+            return "Webex同期に失敗しました。次回の同期で再試行します。"
+        }
+    }
+
+    private func recordWebexDiagnostic(_ event: WebexDiagnosticEvent) async {
+        // Diagnostics must never make collection fail. The logger accepts only
+        // typed, redacted fields and independently enforces private storage.
+        try? await webexDiagnosticLogger.record(event)
+    }
+
+    private static func webexDurationMilliseconds(since start: Date) -> Int {
+        max(0, Int(Date().timeIntervalSince(start) * 1_000))
     }
 
     private func restartSummaryScheduler() {

@@ -59,6 +59,7 @@ struct MainWindowView: View {
 
     private enum Section: String, CaseIterable, Identifiable {
         case dashboard = "ワークログ"
+        case webex = "Webex"
         case speakers = "話者"
         case settings = "設定"
 
@@ -66,6 +67,7 @@ struct MainWindowView: View {
         var icon: String {
             switch self {
             case .dashboard: return "waveform.path.ecg"
+            case .webex: return "bubble.left.and.bubble.right.fill"
             case .speakers: return "person.2.wave.2"
             case .settings: return "gearshape"
             }
@@ -107,6 +109,8 @@ struct MainWindowView: View {
                     switch selection {
                     case .dashboard:
                         DashboardView(controller: controller)
+                    case .webex:
+                        WebexSettingsView(controller: controller)
                     case .speakers:
                         SpeakerManagementView(controller: controller)
                     case .settings:
@@ -464,6 +468,193 @@ private struct OCRCaptureReviewSheet: View {
     }
 }
 
+private struct WebexSettingsView: View {
+    @ObservedObject var controller: DesklogController
+    @State private var accessToken = ""
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Webex連携", systemImage: "bubble.left.and.bubble.right.fill")
+                        .font(.largeTitle.bold())
+                    Text("Personal Access Tokenを登録すると、DesklogがWebexの当日ログを収集します。")
+                        .foregroundStyle(.secondary)
+                }
+
+                GroupBox("1. アクセストークンを取得") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Webex公式ページへサインインし、Personal Access Tokenをコピーしてください。")
+                        Link(destination: WebexAPIClient.personalAccessTokenURL) {
+                            Label(
+                                "Webex公式のアクセストークン取得ページを開く",
+                                systemImage: "arrow.up.right.square"
+                            )
+                        }
+                        Text(WebexAPIClient.personalAccessTokenURL.absoluteString)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+                }
+
+                GroupBox("2. アクセストークンを入力") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Webex Personal Access Token")
+                            .font(.headline)
+                        SecureField(
+                            "Webexアクセストークン",
+                            text: $accessToken,
+                            prompt: Text(
+                                controller.hasWebexCredential
+                                    ? "新しいトークンを貼り付けて認証を更新"
+                                    : "取得したトークンをここに貼り付け"
+                            )
+                        )
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)
+                        .textContentType(.password)
+                        .controlSize(.large)
+                        .accessibilityLabel("Webexアクセストークン")
+                        .onSubmit { connect() }
+
+                        HStack(spacing: 12) {
+                            Button(
+                                controller.hasWebexCredential ? "トークンを更新" : "保存して接続",
+                                action: connect
+                            )
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!canConnect)
+
+                            if controller.isAuthenticatingWebex || controller.isSyncingWebex {
+                                ProgressView().controlSize(.small)
+                            }
+
+                            Label(controller.webexStatusMessage, systemImage: statusIcon)
+                                .foregroundStyle(statusColor)
+                                .textSelection(.enabled)
+                        }
+
+                        Text("トークンは設定ファイルやログには書かず、このMacのKeychainだけに保存します。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+                }
+
+                GroupBox("3. 収集") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Toggle(
+                            "自分が投稿した日のスペースとDMを収集",
+                            isOn: $controller.configuration.webexCollectionEnabled
+                        )
+                        .toggleStyle(.switch)
+                        .disabled(!controller.hasWebexCredential)
+
+                        Text("その日に自分が1件以上投稿したスペースとDMだけを対象に、同日の参加者全員の会話を収集します。返信は親メッセージ直下にまとめ、期間内の添付ファイルも保存します。")
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        HStack(spacing: 12) {
+                            Button("今すぐ同期") { controller.syncWebexNow() }
+                                .disabled(
+                                    !controller.hasWebexCredential ||
+                                        !controller.configuration.webexCollectionEnabled ||
+                                        controller.isAuthenticatingWebex ||
+                                        controller.isSyncingWebex
+                                )
+
+                            if controller.hasWebexCredential {
+                                Button("認証情報を削除", role: .destructive) {
+                                    controller.disconnectWebex()
+                                }
+                                .disabled(
+                                    controller.isAuthenticatingWebex || controller.isSyncingWebex
+                                )
+                            }
+
+                            if let lastSync = controller.lastWebexSyncAt {
+                                Text("最終同期: \(lastSync.formatted(date: .abbreviated, time: .standard))")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        Text("暗号化などでWebexが検査できない添付も強制取得します。感染判定されたファイルはWebex側で取得できません。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+                }
+
+                GroupBox("4. トラブルシュート") {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Webex同期の処理段階、件数、HTTPステータス、安全化したエラー分類をJSONLで記録します。")
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Button {
+                            controller.revealWebexDiagnosticLog()
+                        } label: {
+                            Label("診断ログをFinderで表示", systemImage: "doc.text.magnifyingglass")
+                        }
+
+                        if let diagnosticID = controller.lastWebexDiagnosticID {
+                            Text("直近の診断ID: \(diagnosticID)")
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                        }
+
+                        Text(controller.webexDiagnosticLogPath)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+
+                        Text("アクセストークン、メッセージ本文、URL、Webex内部ID、表示名・メール、応答本文、添付名は診断ログに記録しません。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 4)
+                }
+            }
+            .frame(maxWidth: 820, alignment: .leading)
+            .padding(24)
+        }
+        .navigationTitle("Webex")
+    }
+
+    private var canConnect: Bool {
+        !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            !controller.isAuthenticatingWebex
+    }
+
+    private var statusColor: Color {
+        if controller.webexConnectionFailed { return .red }
+        if controller.webexSyncWarning { return .orange }
+        if controller.hasWebexCredential { return .green }
+        return .secondary
+    }
+
+    private var statusIcon: String {
+        if controller.webexConnectionFailed { return "xmark.circle.fill" }
+        if controller.webexSyncWarning { return "exclamationmark.triangle.fill" }
+        if controller.hasWebexCredential { return "checkmark.circle.fill" }
+        return "circle"
+    }
+
+    private func connect() {
+        guard canConnect else { return }
+        let token = accessToken
+        accessToken = ""
+        controller.connectWebex(accessToken: token)
+    }
+}
+
 private struct SettingsView: View {
     @ObservedObject var controller: DesklogController
     @ObservedObject private var permissions: PermissionCoordinator
@@ -728,7 +919,8 @@ private struct SettingsView: View {
                 Label("OCR・Whisper・話者認識はこのMac内で実行", systemImage: "checkmark.shield.fill")
                     .foregroundStyle(.green)
                 Label("要約先はlocalhostのOllamaだけ", systemImage: "network.badge.shield.half.filled")
-                Text("外部ホストはコード上で拒否されます。`make verify-local-only` で通信境界と保存権限のテストを再実行できます。")
+                Label("Webex収集をオンにした場合だけWebex APIへ接続", systemImage: "network")
+                Text("Webexの本文・添付はローカルに保存し、要約はlocalhostから外へ送りません。`make verify-local-only` で通信境界と保存権限のテストを再実行できます。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

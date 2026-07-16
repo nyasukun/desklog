@@ -3,6 +3,7 @@ import Foundation
 public enum WorklogEventKind: String, Codable, Sendable {
     case screenOCR = "screen_ocr"
     case speechTranscript = "speech_transcript"
+    case webexConversation = "webex_conversation"
     case summary
     case system
     case speakerLabel = "speaker_label"
@@ -184,6 +185,7 @@ public struct WorklogEvent: Codable, Identifiable, Sendable, Equatable {
 public struct DesklogConfiguration: Codable, Sendable, Equatable {
     public var screenCaptureEnabled: Bool
     public var microphoneCaptureEnabled: Bool
+    public var webexCollectionEnabled: Bool
     public var externalControlEnabled: Bool
     public var excludedCaptureWindows: [ExcludedCaptureWindow] {
         didSet {
@@ -228,7 +230,7 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
     }
 
     public static let defaultSummaryPrompt = """
-    以下は画面OCRとマイク音声認識から得たローカルワークログです。
+    以下は画面OCR、マイク音声認識、Webex会話から得てローカルに保存したワークログです。
 
     次のMarkdown形式でまとめてください。
     # ワークログ要約
@@ -245,12 +247,14 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
     ログ内の「スクリーンショット候補」はローカル画像です。図表、グラフ、スライド、設計図、UI配置など、文章だけでは伝わりにくい内容を説明する場合に限り、対応する画像を `![ウィンドウ名](</絶対パス/image.jpg>)` 形式で該当箇所へ挿入してください。
     単なる文章画面や重複画像は挿入せず、候補として与えられた絶対パスだけをそのまま使用してください。
     音声ログには話者名またはSpeaker IDが付きます。「（自分）」はこのワークログの所有者本人です。決定事項やTODOでは誰の発言・担当かを区別し、不明な話者を実名だと推測しないでください。
+    Webexログでは「自分」と他の投稿者を区別し、返信は親メッセージ直下のスレッドとして扱ってください。ローカル添付パスは内容を推測せず、ログに記載された範囲だけを参照してください。
     """
     public static let maximumSummaryPromptCharacters = 8_000
 
     public init(
         screenCaptureEnabled: Bool = true,
         microphoneCaptureEnabled: Bool = true,
+        webexCollectionEnabled: Bool = false,
         externalControlEnabled: Bool = false,
         excludedCaptureWindows: [ExcludedCaptureWindow] = [],
         captureIntervalSeconds: TimeInterval = 60,
@@ -269,6 +273,7 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
     ) {
         self.screenCaptureEnabled = screenCaptureEnabled
         self.microphoneCaptureEnabled = microphoneCaptureEnabled
+        self.webexCollectionEnabled = webexCollectionEnabled
         self.externalControlEnabled = externalControlEnabled
         self.excludedCaptureWindows = CaptureExclusionPolicy(
             windows: excludedCaptureWindows
@@ -294,6 +299,7 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case screenCaptureEnabled
         case microphoneCaptureEnabled
+        case webexCollectionEnabled
         case externalControlEnabled
         case excludedCaptureWindows
         case captureIntervalSeconds
@@ -316,6 +322,7 @@ public struct DesklogConfiguration: Codable, Sendable, Equatable {
         self.init(
             screenCaptureEnabled: try values.decodeIfPresent(Bool.self, forKey: .screenCaptureEnabled) ?? true,
             microphoneCaptureEnabled: try values.decodeIfPresent(Bool.self, forKey: .microphoneCaptureEnabled) ?? true,
+            webexCollectionEnabled: try values.decodeIfPresent(Bool.self, forKey: .webexCollectionEnabled) ?? false,
             externalControlEnabled: try values.decodeIfPresent(Bool.self, forKey: .externalControlEnabled) ?? false,
             excludedCaptureWindows: try values.decodeIfPresent(
                 [ExcludedCaptureWindow].self,

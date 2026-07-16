@@ -84,4 +84,71 @@ import Testing
         #expect(chunks.count == 3)
         #expect(chunks.flatMap { $0.timeline.components(separatedBy: "\n") }.joined().contains("会話"))
     }
+
+    @Test func webexOnlyTimelineUsesDMLabelAndPreservesThreadLines() throws {
+        let start = Date(timeIntervalSince1970: 30_000)
+        let thread = """
+        [09:00] 自分: 進捗を共有
+          ↳ [09:05] 佐藤: 了解しました
+          ↳ [09:07] 自分: 次の作業に進みます
+        """
+        let event = WorklogEvent(
+            timestamp: start,
+            kind: .webexConversation,
+            text: thread,
+            metadata: [
+                "webex_room_id": "direct-room",
+                "webex_room_type": "direct",
+                "webex_room_title": "佐藤"
+            ]
+        )
+
+        let timeline = try TimelineBuilder.build(
+            events: [event],
+            start: start,
+            end: start.addingTimeInterval(60)
+        ).timeline
+
+        #expect(timeline.contains("[Webex/DM/佐藤]"))
+        #expect(timeline.contains(thread))
+        #expect(timeline.contains("\n  ↳ [09:05]"))
+    }
+
+    @Test func webexSpaceRemainsChronologicalWithOCRAndSpeech() throws {
+        let start = Date(timeIntervalSince1970: 40_000)
+        let events = [
+            WorklogEvent(
+                timestamp: start.addingTimeInterval(2),
+                kind: .speechTranscript,
+                text: "音声の確認"
+            ),
+            WorklogEvent(
+                timestamp: start.addingTimeInterval(1),
+                kind: .webexConversation,
+                text: "Webexで設計を共有",
+                metadata: [
+                    "webex_room_id": "group-room",
+                    "webex_room_type": "group",
+                    "webex_room_title": "設計スペース"
+                ]
+            ),
+            WorklogEvent(
+                timestamp: start,
+                kind: .screenOCR,
+                text: "画面の確認"
+            )
+        ]
+
+        let timeline = try TimelineBuilder.build(
+            events: events,
+            start: start,
+            end: start.addingTimeInterval(60)
+        ).timeline
+        let screenRange = try #require(timeline.range(of: "[画面OCR]"))
+        let webexRange = try #require(timeline.range(of: "[Webex/スペース/設計スペース]"))
+        let speechRange = try #require(timeline.range(of: "[音声/Speaker-Unknown]"))
+
+        #expect(screenRange.lowerBound < webexRange.lowerBound)
+        #expect(webexRange.lowerBound < speechRange.lowerBound)
+    }
 }

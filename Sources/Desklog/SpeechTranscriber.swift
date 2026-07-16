@@ -359,6 +359,7 @@ final class SpeechTranscriber: ObservableObject {
                 let output = try await whisperRunner.transcribe(
                     samples: snapshot.samples,
                     sampleRate: snapshot.sampleRate,
+                    freshSampleRange: snapshot.freshSampleRange,
                     executablePath: configuration.whisperExecutablePath,
                     modelPath: configuration.whisperModelPath,
                     language: Self.whisperLanguage(from: configuration.speechLocale)
@@ -373,7 +374,7 @@ final class SpeechTranscriber: ObservableObject {
                     let isCurrentSession = self.sessionID == transcriptionSessionID
                     for (index, utterance) in utterances.enumerated() {
                         let cleaned = utterance.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !cleaned.isEmpty else { continue }
+                        guard SpeechActivityGate.isMeaningfulTranscript(cleaned) else { continue }
                         let temporaryLabel = utterance.localSpeakerID >= 0
                             ? "Speaker \(utterance.localSpeakerID + 1)"
                             : "Speaker ?"
@@ -524,6 +525,7 @@ private final class AudioSampleAccumulator: @unchecked Sendable {
     struct Snapshot: Sendable {
         let samples: [Float]
         let sampleRate: Double
+        let freshSampleRange: Range<Int>
     }
 
     private let lock = NSLock()
@@ -557,10 +559,15 @@ private final class AudioSampleAccumulator: @unchecked Sendable {
             return nil
         }
         let result = samples
+        let freshSampleRange = retainedSampleCount..<samples.count
         let overlapCount = min(samples.count, Int(sampleRate * overlapSeconds))
         samples = overlapCount > 0 ? Array(samples.suffix(overlapCount)) : []
         retainedSampleCount = overlapCount
-        return .init(samples: result, sampleRate: sampleRate)
+        return .init(
+            samples: result,
+            sampleRate: sampleRate,
+            freshSampleRange: freshSampleRange
+        )
     }
 
     nonisolated static func normalizedLevel(for buffer: AVAudioPCMBuffer) -> Double {
@@ -627,6 +634,7 @@ private actor WhisperRunner {
     func transcribe(
         samples: [Float],
         sampleRate: Double,
+        freshSampleRange: Range<Int>,
         executablePath: String,
         modelPath: String,
         language: String
@@ -636,8 +644,37 @@ private actor WhisperRunner {
         defer { finishProcessingTurn() }
         try Task.checkCancellation()
 
-        guard Self.containsSpeech(samples) else { return .init(fullText: "", utterances: []) }
-        let resampled = Self.resample(samples, from: sampleRate, to: 16_000)
+        let activityRange = SpeechActivityGate.analysisRange(
+            forFreshRange: freshSampleRange,
+            sampleRate: sampleRate,
+            sampleCount: samples.count
+        )
+        guard SpeechActivityGate.containsSustainedActivity(
+            in: samples,
+            sampleRate: sampleRate,
+            range: activityRange
+        ) else {
+            return .init(fullText: "", utterances: [])
+        }
+        let lowerBound = min(samples.count, max(0, freshSampleRange.lowerBound))
+        let upperBound = min(samples.count, max(lowerBound, freshSampleRange.upperBound))
+        guard lowerBound < upperBound else { return .init(fullText: "", utterances: []) }
+
+        let resampled = try AudioSampleRateConverter.resample(
+            samples,
+            from: sampleRate,
+            to: 16_000
+        )
+        let diarization = try await diarize(resampled)
+        let freshStartTime = Float(Double(lowerBound) / sampleRate)
+        let freshEndTime = Float(Double(upperBound) / sampleRate)
+        let freshTimeRange = freshStartTime..<freshEndTime
+        guard SpeechActivityGate.containsSustainedSpeech(
+            in: diarization.segments,
+            overlapping: freshTimeRange
+        ) else {
+            return .init(fullText: "", utterances: [])
+        }
         let whisperResult = try await LocalWhisperProcess.run(
             samples16kHz: resampled,
             executablePath: executablePath,
@@ -645,7 +682,6 @@ private actor WhisperRunner {
             language: language,
             temporaryDirectory: Self.temporaryDirectory
         )
-        let diarization = try await diarize(resampled)
         return Self.associate(whisper: whisperResult, diarization: diarization)
     }
 
@@ -785,33 +821,6 @@ private actor WhisperRunner {
         if time < segment.startTime { return segment.startTime - time }
         if time > segment.endTime { return time - segment.endTime }
         return 0
-    }
-
-    private static func containsSpeech(_ samples: [Float]) -> Bool {
-        guard !samples.isEmpty else { return false }
-        var squareSum = 0.0
-        var peak = 0.0
-        for value in samples {
-            let sample = Double(value)
-            squareSum += sample * sample
-            peak = max(peak, abs(sample))
-        }
-        let rms = sqrt(squareSum / Double(samples.count))
-        return peak >= 0.01 || rms >= 0.002
-    }
-
-    private static func resample(_ input: [Float], from inputRate: Double, to outputRate: Double) -> [Float] {
-        guard !input.isEmpty, inputRate > 0 else { return [] }
-        if abs(inputRate - outputRate) < 1 { return input }
-        let outputCount = max(1, Int(Double(input.count) * outputRate / inputRate))
-        let ratio = inputRate / outputRate
-        return (0..<outputCount).map { outputIndex in
-            let position = Double(outputIndex) * ratio
-            let lower = min(input.count - 1, Int(position))
-            let upper = min(input.count - 1, lower + 1)
-            let fraction = Float(position - Double(lower))
-            return input[lower] + (input[upper] - input[lower]) * fraction
-        }
     }
 
 }

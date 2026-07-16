@@ -80,12 +80,18 @@ public enum TimelineBuilder {
         events: [WorklogEvent],
         speakerProfiles: [SpeakerProfile]
     ) throws -> [TimelineEntry] {
-        let relevant = events.filter { $0.kind == .screenOCR || $0.kind == .speechTranscript }
+        let relevant = events.filter {
+            $0.kind == .screenOCR ||
+                $0.kind == .speechTranscript ||
+                $0.kind == .webexConversation
+        }
         guard !relevant.isEmpty else { throw DesklogError.noLogData }
 
         let speechEvents = latestSpeechSnapshots(from: relevant)
         let screens = deduplicatedScreens(from: relevant)
-        let combined = (screens + speechEvents).sorted { $0.timestamp < $1.timestamp }
+        let webexConversations = relevant.filter { $0.kind == .webexConversation }
+        let combined = (screens + speechEvents + webexConversations)
+            .sorted { $0.timestamp < $1.timestamp }
 
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "ja_JP")
@@ -113,16 +119,39 @@ public enum TimelineBuilder {
             let source: String
             if event.kind == .screenOCR {
                 source = "画面OCR"
-            } else {
+            } else if event.kind == .speechTranscript {
                 let profileID = event.metadata["speaker_profile_id"] ?? event.metadata["speaker_id"] ?? "Speaker-Unknown"
                 let manual = speakerLabels[profileID]
                 let storedName = event.metadata["speaker_name"]
                 let name = manual?.name ?? storedName ?? profileID
                 let isSelf = manual?.isSelf ?? (event.metadata["is_self"] == "true")
                 source = isSelf ? "音声/\(name)（自分）" : "音声/\(name)"
+            } else {
+                let roomType = event.metadata["webex_room_type"]?.lowercased()
+                let category = roomType == "direct" ? "DM" : "スペース"
+                let normalizedTitle = normalize(
+                    event.metadata["webex_room_title"] ?? "名称なし"
+                )
+                let title = normalizedTitle.isEmpty ? "名称なし" : normalizedTitle
+                source = "Webex/\(category)/\(title)"
             }
-            let limit = event.kind == .screenOCR ? 6_000 : 8_000
-            let content = String(normalize(event.text).prefix(limit))
+            let limit: Int
+            let normalizedText: String
+            switch event.kind {
+            case .screenOCR:
+                limit = 6_000
+                normalizedText = normalize(event.text)
+            case .speechTranscript:
+                limit = 8_000
+                normalizedText = normalize(event.text)
+            case .webexConversation:
+                limit = maximumSummaryChunkCharacters
+                normalizedText = normalizeWebexConversation(event.text)
+            default:
+                limit = 8_000
+                normalizedText = normalize(event.text)
+            }
+            let content = String(normalizedText.prefix(limit))
             var line = "[\(formatter.string(from: event.timestamp))][\(source)] \(content)"
             if event.kind == .screenOCR, let path = event.metadata["image_path"] {
                 let title = event.metadata["display_title"]
@@ -176,6 +205,12 @@ public enum TimelineBuilder {
     private static func normalize(_ text: String) -> String {
         text.split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizeWebexConversation(_ text: String) -> String {
+        text.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
